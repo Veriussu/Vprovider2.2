@@ -105,6 +105,13 @@ class Settings(BaseSettings):
     # HuggingFace (isteğe bağlı: gated repolar için)
     hf_token: str = ""
 
+    # Harici llama.cpp sunucuları. Stock llama-cpp-python'in okuyamadığı
+    # özel GGUF quant'ları (örn. Prism/Bonsai PQ2_0/PTQ1_0) için kullanılır.
+    prism_llama_server_bin: str = ""
+    prism_llama_host: str = "127.0.0.1"
+    prism_llama_port_start: int = 19100
+    prism_llama_extra_args: str = "-ngl 99 --jinja"
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     @property

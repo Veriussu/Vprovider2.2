@@ -104,3 +104,101 @@ def test_audio_store_roundtrip():
         tts.store_audio(f"k{i}", b"X", "audio/mpeg")
     assert tts.get_stored_audio("k1") is None  # eski silindi
     assert tts.get_stored_audio(f"k{tts.AUDIO_STORE_CAP + 4}") is not None
+
+
+# ------------------------------------------------------------------
+# Eklenti (plugin) motoru köprüsü
+# ------------------------------------------------------------------
+
+class _FakeResp:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = str(payload)
+
+    def json(self):
+        return self._payload
+
+
+def _wav(seconds=1.0, sr=24000) -> bytes:
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(b"\x00\x00" * int(sr * seconds))
+    return buf.getvalue()
+
+
+def test_language_from_voice():
+    """'voice' alanından XTTS dil kodu çıkarılır."""
+    assert tts._language_from_voice("tr-TR-EmelNeural") == "tr"
+    assert tts._language_from_voice("en") == "en"
+    assert tts._language_from_voice("") == "en"
+    assert tts._language_from_voice("Emel") == "en"
+
+
+def test_wav_duration_sec():
+    """WAV süresi başlıktan doğru okunur; geçersiz veri 0 döner."""
+    assert tts.wav_duration_sec(_wav(2.0, 16000)) == pytest.approx(2.0, abs=0.05)
+    assert tts.wav_duration_sec(b"not-a-wav") == 0.0
+
+
+def test_synthesize_plugin_ok(monkeypatch):
+    """Eklenti çalışırken synthesize plugin motoruyla WAV döner."""
+    import base64
+
+    from app import plugins
+
+    monkeypatch.setattr(tts.settings, "tts_enabled", True)
+    monkeypatch.setattr(
+        plugins, "running_port_for_category",
+        lambda category, prefer=(): ("xtts_v2", 19999),
+    )
+    wav = _wav(1.0)
+
+    async def fake_post(url, payload):
+        assert url == "http://127.0.0.1:19999/synthesize"
+        assert payload["text"] == "merhaba"
+        assert payload["language"] == "tr"
+        return _FakeResp(200, {"audio": base64.b64encode(wav).decode(), "sample_rate": 24000})
+
+    monkeypatch.setattr(tts, "_post_json", fake_post)
+    data, mime = asyncio.run(
+        tts.synthesize("merhaba", engine="plugin", voice="tr-TR-EmelNeural")
+    )
+    assert data == wav
+    assert mime == "audio/wav"
+
+
+def test_synthesize_plugin_not_running(monkeypatch):
+    """Çalışan TTS eklentisi yoksa anlaşılır hata verilir."""
+    from app import plugins
+
+    monkeypatch.setattr(tts.settings, "tts_enabled", True)
+    monkeypatch.setattr(plugins, "running_port_for_category", lambda category, prefer=(): None)
+    with pytest.raises(TTSError) as exc:
+        asyncio.run(tts.synthesize("merhaba", engine="plugin"))
+    assert "çalışmıyor" in str(exc.value)
+
+
+def test_synthesize_plugin_http_error(monkeypatch):
+    """Eklenti 500 dönerse hata ayrıntısı taşınır."""
+    from app import plugins
+
+    monkeypatch.setattr(tts.settings, "tts_enabled", True)
+    monkeypatch.setattr(
+        plugins, "running_port_for_category",
+        lambda category, prefer=(): ("xtts_v2", 19999),
+    )
+
+    async def fake_post(url, payload):
+        return _FakeResp(500, {"error": "model patladı"})
+
+    monkeypatch.setattr(tts, "_post_json", fake_post)
+    with pytest.raises(TTSError) as exc:
+        asyncio.run(tts.synthesize("merhaba", engine="plugin"))
+    assert "model patladı" in str(exc.value)

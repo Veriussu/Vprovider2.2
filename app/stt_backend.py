@@ -7,12 +7,15 @@ import asyncio
 import io
 import logging
 import os
+import tempfile
+from pathlib import Path
 import threading
 import time
 from typing import Optional, Tuple
 
 import numpy as np
 from app.config import settings
+from app.runtime_coord import accelerator
 
 logger = logging.getLogger("vprovider")
 
@@ -43,23 +46,54 @@ def _get_stored_transcription(key: str) -> Optional[dict]:
 
 
 def _ensure_model_dir(model_name: str) -> str:
-    """Modelin yerel yolu döner; yoksa HF'ten indirmeye çalışır."""
+    """Modelin yerel yolu döner; yoksa HuggingFace'ten indirir."""
     model_path = settings.models_path / "ct2" / model_name
     if model_path.exists() and (model_path / "model.bin").exists():
         return str(model_path)
 
-    # Model mevcut değilse, varsayılan modeli indirelim
-    logger.info(f"Model {model_name} bulunamadı, varsayılan model kuruluyor...")
-    # Not: Gerçek indirme admin API üzerinden yapılmalı, buradaki fallback sadece dev için
     default_model = settings.models_path / "ct2" / "default"
-    if default_model.exists():
+    if default_model.exists() and (default_model / "model.bin").exists():
         return str(default_model)
-    
-    # Hiç model yoksa hata
-    raise STTError(f"Model {model_name} mevcut değil ve indirilemedi.")
+
+    logger.info("STT modeli indiriliyor: %s", model_name)
+    try:
+        from faster_whisper.utils import download_model
+
+        downloaded = download_model(model_name, output_dir=str(model_path))
+        if (Path(downloaded) / "model.bin").exists():
+            return str(downloaded)
+        if (model_path / "model.bin").exists():
+            return str(model_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("STT modeli indirilemedi: %s", model_name)
+        raise STTError(f"STT modeli indirilemedi: {exc}") from exc
+
+    raise STTError(f"STT modeli bulunamadı: {model_name}")
 
 
 async def transcribe_audio(
+    audio_bytes: bytes,
+    model: str = "base",
+    language: Optional[str] = None,
+    prompt: Optional[str] = None,
+    temperature: float = 0.0,
+    response_format: str = "json",
+    timestamp_granularities: list = ["segment"],
+) -> dict:
+    """Ses verisini metne çevirir (OpenAI uyumlu).
+
+    GPU işi (model yükleme + çıkarım) VProvider geneli tek iş kuyruğundan
+    geçer; aynı anda başka bir model işi çalışmaz.
+    """
+    async with accelerator.acquire(f"stt:{model}"):
+        return await asyncio.to_thread(
+            _transcribe_core,
+            audio_bytes, model, language, prompt, temperature,
+            response_format, timestamp_granularities,
+        )
+
+
+def _transcribe_core(
     audio_bytes: bytes,
     model: str = "base",
     language: Optional[str] = None,
@@ -86,51 +120,56 @@ async def transcribe_audio(
     if not settings.stt_enabled:
         raise STTError("STT modülü kapalı (STT_ENABLED=false).")
 
-    # Ses verisini numpy array'e çevir (16-bit PCM WAV varsayımı)
-    try:
-        # Basit WAV parsing - gerçekte daha iyi bir kütüphane kullanılmalı
-        # Şimdilik audio_bytes zaten float32 veya int16 PCM olduğunu varsayalım
-        audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-    except Exception as e:
-        raise STTError(f"Ses verisi işlenemedi: {e}")
+    if not audio_bytes:
+        raise STTError("Ses verisi boş olamaz.")
 
-    # Audio süresini kontrol et
-    duration_seconds = len(audio_np) / 16000  # 16kHz sample rate varsayımı
-    if duration_seconds > MAX_AUDIO_SECONDS:
-        raise STTError(f"Ses çok uzun: maksimum {MAX_AUDIO_SECONDS} saniye.")
-
-    # faster-whisper modelini yükle
+    # faster-whisper modelini yükle (gerekirse indir)
     try:
         from faster_whisper import WhisperModel
-        
+
         model_path = _ensure_model_dir(model)
-        
-        # Model zaten yüklenmemişse yükle
-        if not hasattr(transcribe_audio, "_model") or transcribe_audio._model is None or transcribe_audio._model_path != model_path:
-            logger.info(f"STT modeli yükleniyor: {model_path}")
+
+        if not hasattr(_transcribe_core, "_model") or _transcribe_core._model is None or _transcribe_core._model_path != model_path:
+            logger.info("STT modeli yükleniyor: %s", model_path)
             device = "cuda" if settings.gpu_mode != "cpu" else "cpu"
             compute_type = "float16" if device == "cuda" else "int8"
-            
-            transcribe_audio._model = WhisperModel(
-                model_path, 
-                device=device, 
-                compute_type=compute_type
+            _transcribe_core._model = WhisperModel(
+                model_path,
+                device=device,
+                compute_type=compute_type,
             )
-            transcribe_audio._model_path = model_path
-            
-    except ImportError:
+            _transcribe_core._model_path = model_path
+
+    except ImportError as exc:
         raise STTError(
             "faster-whisper kurulu değil. Kurun: pip install faster-whisper "
             "(veya requirements-hub.txt'yi yükleyin)."
-        )
-    except Exception as e:
-        logger.error(f"STT modeli yüklenemedi: {e}")
-        raise STTError(f"STT modeli yüklenemedi: {e}")
+        ) from exc
+    except Exception as exc:
+        logger.error("STT modeli yüklenemedi: %s", exc)
+        raise STTError(f"STT modeli yüklenemedi: {exc}") from exc
 
-    # Transkripsiyonu çalıştır
+    # Ses dosyasını geçici olarak kaydet; librosa/ffmpeg ile 16 kHz mono'ya çevir.
+    suffix = ".wav"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(audio_bytes)
+        audio_path = tmp.name
     try:
-        segments, info = transcribe_audio._model.transcribe(
-            audio_np,
+        try:
+            import librosa
+        except ImportError as exc:
+            raise STTError("librosa kurulu değil; ses çözülemedi.") from exc
+
+        audio, sample_rate = librosa.load(audio_path, sr=16000, mono=True)
+        if sample_rate != 16000:
+            raise STTError("Ses 16 kHz'e dönüştürülemedi.")
+        duration_seconds = len(audio) / sample_rate
+        if duration_seconds > MAX_AUDIO_SECONDS:
+            raise STTError(f"Ses çok uzun: maksimum {MAX_AUDIO_SECONDS} saniye.")
+
+        # Transkripsiyonu çalıştır
+        segments, info = _transcribe_core._model.transcribe(
+            audio,
             language=language,
             initial_prompt=prompt,
             temperature=temperature,
@@ -159,7 +198,10 @@ async def transcribe_audio(
             full_text.append(segment.text)
         
         text = "".join(full_text).strip()
-        
+
+        if getattr(info, "duration", 0) and info.duration > MAX_AUDIO_SECONDS:
+            raise STTError(f"Ses çok uzun: maksimum {MAX_AUDIO_SECONDS} saniye.")
+
         # Yanıtı OpenAI formatında hazırla
         result = {
             "task": "transcribe",
@@ -214,6 +256,11 @@ async def transcribe_audio(
     except Exception as e:
         logger.error(f"STT transkripsiyonu başarısız: {e}")
         raise STTError(f"Transkripsiyon başarısız: {e}")
+    finally:
+        try:
+            os.unlink(audio_path)
+        except OSError:
+            pass
 
 
 async def store_transcription(key: str, text: str, language: str = "tr") -> None:

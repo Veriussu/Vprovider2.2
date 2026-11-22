@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────
+#  Bölüm:    Yönetim CLI'si
+#  Dosya:    scripts/vprovider
+#  Amaç:     VProvider yönetim komutlarının tek giriş noktası
+#  Mekanik:  start | stop | restart | update | clear | delete [all]
+#  Kullanım: vprovider <komut> [seçenekler]
+# ─────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+# Sembolik bağ üzerinden çağrılsa bile gerçek proje kökünü bul
+SELF="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+  RESOLVED="$(readlink -f "${SELF}" 2>/dev/null || true)"
+  [ -n "${RESOLVED}" ] && SELF="${RESOLVED}"
+fi
+PROJECT_ROOT="$(cd "$(dirname "${SELF}")/.." && pwd)"
+
+usage() {
+  cat << 'USAGE'
+Kullanım: vprovider <komut> [seçenekler]
+
+Komutlar:
+  start          Sunucuyu başlatır
+  stop           Sunucuyu durdurur
+  restart        Sunucuyu durdurup yeniden başlatır
+  update         Git güncellemelerini çeker, bağımlılıkları yeniler
+  clear          Modelleri ve üretilen verileri temizler (motor korunur)
+  delete [all]   VProvider'ı kaldırır
+                 delete      : kod, .env ve modeller korunur
+                 delete all  : proje dizini dahil her şey silinir
+
+Seçenekler:
+  -y, --yes      Onay istemeden devam et (clear/delete için)
+
+Örnekler:
+  vprovider start
+  vprovider restart
+  vprovider update
+  vprovider clear
+  vprovider delete all
+USAGE
+  exit 1
+}
+
+confirm() {
+  # $1 = mesaj; ASSUME_YES=1 ise sormaz
+  if [ "${ASSUME_YES:-0}" = "1" ]; then return 0; fi
+  printf '%s [e/H] ' "$1"
+  read -r ans
+  case "${ans}" in
+    e|E|y|Y|evet|yes) return 0 ;;
+    *) echo "İptal edildi."; return 1 ;;
+  esac
+}
+
+ASSUME_YES=0
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    -y|--yes) ASSUME_YES=1 ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+set -- "${ARGS[@]:-}"
+
+[ $# -lt 1 ] && usage
+cmd="${1:-}"; shift || true
+
+# .env'den dizin adlarını oku (varsayılanlarla)
+read_env() {
+  local key="$1" default="$2" val
+  val="$(grep -E "^${key}=" "${PROJECT_ROOT}/.env" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+  echo "${val:-$default}"
+}
+
+case "$cmd" in
+  start)
+    "${PROJECT_ROOT}/scripts/start.sh" "$@"
+    ;;
+  stop)
+    "${PROJECT_ROOT}/scripts/stop.sh" "$@"
+    ;;
+  restart)
+    "${PROJECT_ROOT}/scripts/restart.sh" "$@"
+    ;;
+  update)
+    echo "Güncellemeler alınıyor..."
+    git -C "${PROJECT_ROOT}" fetch origin
+    git -C "${PROJECT_ROOT}" reset --hard origin/main
+    if [ -x "${PROJECT_ROOT}/.venv/bin/pip" ]; then
+      echo "Bağımlılıklar güncelleniyor..."
+      "${PROJECT_ROOT}/.venv/bin/pip" install -r "${PROJECT_ROOT}/requirements.txt"
+      [ -f "${PROJECT_ROOT}/requirements-hub.txt" ] && \
+        "${PROJECT_ROOT}/.venv/bin/pip" install -r "${PROJECT_ROOT}/requirements-hub.txt"
+    fi
+    echo "✓ Güncellendi."
+    ;;
+  clear)
+    MODELS_DIR="$(read_env MODELS_DIR models)"
+    DATA_DIR="$(read_env DATA_DIR data)"
+    echo "Temizlenecek:"
+    echo "  • modeller : ${PROJECT_ROOT}/${MODELS_DIR}/*"
+    echo "  • veriler  : ${PROJECT_ROOT}/${DATA_DIR}/*"
+    echo "  • loglar   : ${PROJECT_ROOT}/logs/*, ${PROJECT_ROOT}/runtime/*.log"
+    confirm "Onaylıyor musunuz?" || exit 0
+    "${PROJECT_ROOT}/scripts/stop.sh" >/dev/null 2>&1 || true
+    rm -rf "${PROJECT_ROOT:?}/${MODELS_DIR:?}"/* 2>/dev/null || true
+    rm -rf "${PROJECT_ROOT:?}/${DATA_DIR:?}"/* 2>/dev/null || true
+    rm -rf "${PROJECT_ROOT}/logs"/* "${PROJECT_ROOT}/runtime"/*.log 2>/dev/null || true
+    mkdir -p "${PROJECT_ROOT}/${MODELS_DIR}" "${PROJECT_ROOT}/${DATA_DIR}" \
+             "${PROJECT_ROOT}/logs" "${PROJECT_ROOT}/runtime"
+    touch "${PROJECT_ROOT}/${MODELS_DIR}/.gitkeep" \
+          "${PROJECT_ROOT}/${DATA_DIR}/.gitkeep" \
+          "${PROJECT_ROOT}/logs/.gitkeep" \
+          "${PROJECT_ROOT}/runtime/.gitkeep"
+    echo "✓ Modeller ve veriler temizlendi (motor/runtime korundu)."
+    ;;
+  delete)
+    if [ "${1:-}" = "all" ]; then
+      confirm "TÜM proje (kod, modeller, .env) silinecek. Emin misiniz?" || exit 0
+      "${PROJECT_ROOT}/scripts/remove.sh" --all
+    else
+      confirm "VProvider kaldırılacak (kod ve .env korunur). Emin misiniz?" || exit 0
+      "${PROJECT_ROOT}/scripts/remove.sh"
+    fi
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    echo "✗ Bilinmeyen komut: ${cmd}" >&2
+    usage
+    ;;
+esac

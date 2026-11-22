@@ -29,6 +29,7 @@ from typing import Callable, Optional
 
 from app import ai_hub, registry
 from app.config import settings
+from app.runtime_coord import accelerator
 
 # Bu yönetici yalnızca şu kategorileri üretir
 SUPPORTED_CATEGORIES = (registry.CAT_IMAGE, registry.CAT_VIDEO)
@@ -379,28 +380,34 @@ class MediaManager:
         task = "video" if info.category == registry.CAT_VIDEO else "txt2img"
         if memory_mode:
             self._modes[model_id] = memory_mode
-        async with self._lock_for(model_id):
-            await self._ensure_pipeline(model_id, task)
+        async with accelerator:
+            async with self._lock_for(model_id):
+                await self._ensure_pipeline(model_id, task)
         return True
 
     async def unload(self, model_id: str) -> bool:
         """Modeli bellekten boşaltır (VRAM/RAM bırakır)."""
         self._cancel_idle(model_id)
-        async with self._lock_for(model_id):
-            keys = [k for k in self._pipelines if k[0] == model_id]
-            if not keys:
-                return False
-            for key in keys:
-                self._pipelines.pop(key, None)
-            # torch önbelleğini ve Python referanslarını bırak
-            gc.collect()
-            try:
-                torch = _torch()
-                if torch is not None and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
-            return True
+        async with accelerator:
+            async with self._lock_for(model_id):
+                return await self._unload_pipeline_locked(model_id)
+
+    async def _unload_pipeline_locked(self, model_id: str) -> bool:
+        """Pipeline'ı boşaltır (kilit ve GPU kuyruğu zaten tutulmalı)."""
+        keys = [k for k in self._pipelines if k[0] == model_id]
+        if not keys:
+            return False
+        for key in keys:
+            self._pipelines.pop(key, None)
+        # torch önbelleğini ve Python referanslarını bırak
+        gc.collect()
+        try:
+            torch = _torch()
+            if torch is not None and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        return True
 
     def set_memory_mode(self, model_id: str, memory_mode: str) -> None:
         """Tek modelin bellek modunu değiştirir (keep/dynamic)."""
@@ -410,7 +417,7 @@ class MediaManager:
         if memory_mode == self.MEMORY_KEEP:
             self._cancel_idle(model_id)
         elif self._is_loaded(model_id):
-            self._release_after_use(model_id)
+            self._schedule_release(model_id)
 
     def set_global_memory_mode(self, memory_mode: str) -> None:
         if memory_mode not in (self.MEMORY_KEEP, self.MEMORY_DYNAMIC):
@@ -445,21 +452,22 @@ class MediaManager:
             raise MediaError(f"'{model_id}' modeli bulunamadı.")
         task = "video" if info.category == registry.CAT_VIDEO else ("img2img" if image is not None else "txt2img")
 
-        async with self._lock_for(model_id):
-            pipeline = await self._ensure_pipeline(model_id, task)
-            try:
-                if task == "video":
-                    result = await asyncio.to_thread(
-                        self._run_video, pipeline, info, prompt, negative_prompt,
-                        size, steps, cfg, seed, frames, fps,
-                    )
-                else:
-                    result = await asyncio.to_thread(
-                        self._run_image, pipeline, prompt, negative_prompt,
-                        size, steps, cfg, seed, n, image,
-                    )
-            finally:
-                self._release_after_use(model_id)
+        async with accelerator:
+            async with self._lock_for(model_id):
+                pipeline = await self._ensure_pipeline(model_id, task)
+                try:
+                    if task == "video":
+                        result = await asyncio.to_thread(
+                            self._run_video, pipeline, info, prompt, negative_prompt,
+                            size, steps, cfg, seed, frames, fps,
+                        )
+                    else:
+                        result = await asyncio.to_thread(
+                            self._run_image, pipeline, prompt, negative_prompt,
+                            size, steps, cfg, seed, n, image,
+                        )
+                finally:
+                    await self._finish_use(model_id)
         result.model_id = model_id
         return result
 
@@ -536,7 +544,18 @@ class MediaManager:
     # Dinamik boşaltma
     # ------------------------------------------------------------------
 
-    def _release_after_use(self, model_id: str) -> None:
+    async def _finish_use(self, model_id: str) -> None:
+        """Kilit ve GPU kuyruğu tutulurken boşaltmayı düzenler."""
+        if self._mode_for(model_id) != self.MEMORY_DYNAMIC:
+            return
+        self._cancel_idle(model_id)
+        if self.idle_timeout_minutes > 0:
+            self._reschedule_idle(model_id)
+        else:
+            await self._unload_pipeline_locked(model_id)
+
+    def _schedule_release(self, model_id: str) -> None:
+        """Kilit tutulmadan çağrılan boşaltma planlayıcısı (panel mod değişimi)."""
         if self._mode_for(model_id) != self.MEMORY_DYNAMIC:
             return
         self._cancel_idle(model_id)

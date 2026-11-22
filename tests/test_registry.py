@@ -104,6 +104,48 @@ def test_scan_typed_missing_dir_is_empty(tmp_path):
     assert registry.scan_typed(models_dir=tmp_path / "yok") == []
 
 
+def test_scan_typed_detects_category_dirs(tmp_path):
+    """Kategori klasörleri (image/video/music/tts/...) biçimle bulunur."""
+    models = tmp_path / "models"
+
+    # image: diffusers pipeline doğrudan models/image/ altında
+    img = models / "image" / "sd-turbo"
+    img.mkdir(parents=True)
+    (img / "model_index.json").write_text(
+        json.dumps({"_class_name": "StableDiffusionPipeline"}), "utf-8"
+    )
+    (img / "diffusion_pytorch_model.safetensors").write_bytes(b"x")
+
+    # tts: transformers ağırlığı (config.json + safetensors)
+    tts = models / "tts" / "kokoro"
+    tts.mkdir(parents=True)
+    (tts / "config.json").write_text(json.dumps({"model_type": "kokoro"}), "utf-8")
+    (tts / "model.safetensors").write_bytes(b"x")
+
+    # stt: ctranslate2 dizini
+    stt = models / "stt" / "faster-whisper"
+    stt.mkdir(parents=True)
+    (stt / "config.json").write_text(json.dumps({"model": "whisper"}), "utf-8")
+    (stt / "model.bin").write_bytes(b"x")
+
+    # music: diffusers pipeline
+    mus = models / "music" / "musicgen"
+    mus.mkdir(parents=True)
+    (mus / "model_index.json").write_text(
+        json.dumps({"_class_name": "MusicgenPipeline"}), "utf-8"
+    )
+    (mus / "diffusion_pytorch_model.safetensors").write_bytes(b"x")
+
+    found = {e.model_id: e for e in registry.scan_typed(models_dir=models)}
+
+    assert found["sd-turbo"].category == registry.CAT_IMAGE
+    assert found["sd-turbo"].kind == registry.KIND_SAFETENSORS
+    assert found["kokoro"].category == "tts"
+    assert found["faster-whisper"].category == registry.CAT_STT
+    assert found["faster-whisper"].kind == registry.KIND_CT2
+    assert found["musicgen"].category == registry.CAT_MUSIC
+
+
 # ------------------------------------------------------------------
 # GGUF kategorisi (reasoning)
 # ------------------------------------------------------------------
@@ -155,3 +197,17 @@ def test_delete_typed_model_removes_only_that_dir(tmp_path):
 
 def test_delete_typed_model_missing_is_empty(tmp_path):
     assert registry.delete_typed_model("yok", models_dir=tmp_path) == []
+
+
+def test_delete_typed_model_removes_category_dir(tmp_path):
+    """Silme kategori klasörlerindeki (image/music/...) dizinleri de kaldırır."""
+    models = tmp_path / "models"
+    d = models / "music" / "musicgen"
+    d.mkdir(parents=True)
+    (d / "model_index.json").write_text(json.dumps({"_class_name": "MusicgenPipeline"}), "utf-8")
+
+    removed = registry.delete_typed_model("musicgen", models_dir=models)
+
+    assert removed and "musicgen" in removed[0]
+    assert not d.exists()
+

@@ -23,6 +23,7 @@ from typing import AsyncIterator, Callable, Optional
 
 from app.config import settings
 from app.llama_backend import LlamaEngine
+from app.runtime_coord import accelerator
 
 # Motor üretim fonksiyonu: ModelInfo alır, LlamaEngine döner
 EngineFactory = Callable[["ModelInfo"], LlamaEngine]
@@ -147,7 +148,7 @@ class ModelManager:
         self._engines[model_id] = engine
 
         # Yalnızca pozitif idle süresi olan dynamic modda yüklemede bekleyen
-        # boşaltma zamanlanır; 0 (anında boşalt) ise işlem bitince _release_after_use
+        # boşaltma zamanlanır; 0 (anında boşalt) ise işlem bitince _finish_use
         # eliyle boşaltılır (yükleme sırasında planlamak yarışa yol açardı).
         if (
             self._mode_for(model_id) == self.MEMORY_DYNAMIC
@@ -163,19 +164,25 @@ class ModelManager:
         """
         if memory_mode:
             self._modes[model_id] = memory_mode
-        async with self._lock_for(model_id):
-            await self._load_engine(model_id)
+        async with accelerator:
+            async with self._lock_for(model_id):
+                await self._load_engine(model_id)
         return True
 
     async def unload(self, model_id: str) -> bool:
         """Modeli bellekten boşaltır (varsa idle görevini iptal eder)."""
         self._cancel_idle(model_id)
-        async with self._lock_for(model_id):
-            engine = self._engines.pop(model_id, None)
-            if engine is None:
-                return False
-            # Ağır işlem (VRAM/RAM bırakma) olay döngüsünü bloklamasın
-            await asyncio.to_thread(engine.unload)
+        async with accelerator:
+            async with self._lock_for(model_id):
+                return await self._unload_engine_locked(model_id)
+
+    async def _unload_engine_locked(self, model_id: str) -> bool:
+        """Motoru boşaltır (kilit ve GPU kuyruğu zaten tutulmalı)."""
+        engine = self._engines.pop(model_id, None)
+        if engine is None:
+            return False
+        # Ağır işlem (VRAM/RAM bırakma) olay döngüsünü bloklamasın
+        await asyncio.to_thread(engine.unload)
         return True
 
     def set_memory_mode(self, model_id: str, memory_mode: str) -> None:
@@ -189,7 +196,12 @@ class ModelManager:
             self._cancel_idle(model_id)
         elif self._is_loaded(model_id):
             # Dinamik moda geçildi -> boşaltıcı tekrar zamanlanır
-            self._release_after_use(model_id)
+            self._schedule_release(model_id)
+
+    def forget_memory_mode(self, model_id: str) -> None:
+        """Silinen modelin bellek modu kaydını temizler."""
+        self._modes.pop(model_id, None)
+        self._cancel_idle(model_id)
 
     def set_global_memory_mode(self, memory_mode: str) -> None:
         """Varsayılan (küresel) bellek modunu değiştirir."""
@@ -269,76 +281,80 @@ class ModelManager:
 
         **params: OpenAI parametreleri (temperature, max_tokens, top_p, stop...)
         """
-        async with self._lock_for(model_id):
-            engine = await self._ensure_loaded_locked(model_id)
-            try:
-                history, final_params, content = await asyncio.to_thread(
-                    self._web_loop, engine, messages, params
-                )
-                if content is None:
-                    content = await asyncio.to_thread(engine.run_chat, history, **final_params)
-            finally:
-                self._release_after_use(model_id)
+        async with accelerator:
+            async with self._lock_for(model_id):
+                engine = await self._ensure_loaded_locked(model_id)
+                try:
+                    history, final_params, content = await asyncio.to_thread(
+                        self._web_loop, engine, messages, params
+                    )
+                    if content is None:
+                        content = await asyncio.to_thread(engine.run_chat, history, **final_params)
+                finally:
+                    await self._finish_use(model_id)
         return content
 
     async def chat_stream(self, model_id: str, messages: list, **params) -> AsyncIterator[str]:
         """Akışlı (stream) yanıt üretir; aynı modelde başka istek varsa bekler."""
-        async with self._lock_for(model_id):
-            engine = await self._ensure_loaded_locked(model_id)
-            queue: asyncio.Queue = asyncio.Queue()
+        async with accelerator:
+            async with self._lock_for(model_id):
+                engine = await self._ensure_loaded_locked(model_id)
+                queue: asyncio.Queue = asyncio.Queue()
 
-            def produce() -> None:
-                """Senkron üreticiyi kuyruğa taşır (ayrı iş parçacığında çalışır)."""
+                def produce() -> None:
+                    """Senkron üreticiyi kuyruğa taşır (ayrı iş parçacığında çalışır)."""
+                    try:
+                        for chunk in engine.stream_chat(messages, **params):
+                            queue.put_nowait(chunk)
+                    finally:
+                        queue.put_nowait(None)  # bitiş işareti
+
+                producer = asyncio.get_running_loop().run_in_executor(None, produce)
                 try:
-                    for chunk in engine.stream_chat(messages, **params):
-                        queue.put_nowait(chunk)
+                    while True:
+                        chunk = await queue.get()
+                        if chunk is None:
+                            break
+                        yield chunk
                 finally:
-                    queue.put_nowait(None)  # bitiş işareti
-
-            producer = asyncio.get_running_loop().run_in_executor(None, produce)
-            try:
-                while True:
-                    chunk = await queue.get()
-                    if chunk is None:
-                        break
-                    yield chunk
-            finally:
-                await producer
-                self._release_after_use(model_id)
+                    await producer
+                    await self._finish_use(model_id)
 
     async def completion(self, model_id: str, prompt: str, **params) -> str:
         """Akışsız metin tamamlama (completion) üretir."""
-        async with self._lock_for(model_id):
-            engine = await self._ensure_loaded_locked(model_id)
-            try:
-                answer = await asyncio.to_thread(engine.run_completion, prompt, **params)
-            finally:
-                self._release_after_use(model_id)
+        async with accelerator:
+            async with self._lock_for(model_id):
+                engine = await self._ensure_loaded_locked(model_id)
+                try:
+                    answer = await asyncio.to_thread(engine.run_completion, prompt, **params)
+                finally:
+                    await self._finish_use(model_id)
         return answer
 
     async def completion_stream(self, model_id: str, prompt: str, **params) -> AsyncIterator[str]:
         """Akışlı metin tamamlama (completion) üretir."""
-        async with self._lock_for(model_id):
-            engine = await self._ensure_loaded_locked(model_id)
-            queue: asyncio.Queue = asyncio.Queue()
+        async with accelerator:
+            async with self._lock_for(model_id):
+                engine = await self._ensure_loaded_locked(model_id)
+                queue: asyncio.Queue = asyncio.Queue()
 
-            def produce() -> None:
+                def produce() -> None:
+                    try:
+                        for chunk in engine.stream_completion(prompt, **params):
+                            queue.put_nowait(chunk)
+                    finally:
+                        queue.put_nowait(None)
+
+                producer = asyncio.get_running_loop().run_in_executor(None, produce)
                 try:
-                    for chunk in engine.stream_completion(prompt, **params):
-                        queue.put_nowait(chunk)
+                    while True:
+                        chunk = await queue.get()
+                        if chunk is None:
+                            break
+                        yield chunk
                 finally:
-                    queue.put_nowait(None)
-
-            producer = asyncio.get_running_loop().run_in_executor(None, produce)
-            try:
-                while True:
-                    chunk = await queue.get()
-                    if chunk is None:
-                        break
-                    yield chunk
-            finally:
-                await producer
-                self._release_after_use(model_id)
+                    await producer
+                    await self._finish_use(model_id)
 
     async def usage(self, model_id: str) -> dict:
         """Son çağrının token kullanım bilgisini döner (üretilmemişse boş)."""
@@ -368,28 +384,29 @@ class ModelManager:
         sözlük olarak döner (content/tool_args/finish/usage). Eski motorlar
         string parçalar dönerse olduğu gibi aktarılır.
         """
-        async with self._lock_for(model_id):
-            engine = await self._ensure_loaded_locked(model_id)
-            queue: asyncio.Queue = asyncio.Queue()
+        async with accelerator:
+            async with self._lock_for(model_id):
+                engine = await self._ensure_loaded_locked(model_id)
+                queue: asyncio.Queue = asyncio.Queue()
 
-            def produce() -> None:
+                def produce() -> None:
+                    try:
+                        history, final_params, _content = self._web_loop(engine, messages, params)
+                        for ev in engine.stream_chat(history, _yield_events=True, **final_params):
+                            queue.put_nowait(ev)
+                    finally:
+                        queue.put_nowait(None)  # bitiş işareti
+
+                producer = asyncio.get_running_loop().run_in_executor(None, produce)
                 try:
-                    history, final_params, _content = self._web_loop(engine, messages, params)
-                    for ev in engine.stream_chat(history, _yield_events=True, **final_params):
-                        queue.put_nowait(ev)
+                    while True:
+                        ev = await queue.get()
+                        if ev is None:
+                            break
+                        yield ev
                 finally:
-                    queue.put_nowait(None)  # bitiş işareti
-
-            producer = asyncio.get_running_loop().run_in_executor(None, produce)
-            try:
-                while True:
-                    ev = await queue.get()
-                    if ev is None:
-                        break
-                    yield ev
-            finally:
-                await producer
-                self._release_after_use(model_id)
+                    await producer
+                    await self._finish_use(model_id)
 
     async def _ensure_loaded_locked(self, model_id: str) -> LlamaEngine:
         """Modelin yüklü olduğundan emin olur (kilit zaten tutulmalı)."""
@@ -398,12 +415,29 @@ class ModelManager:
             return engine
         return await self._load_engine(model_id)
 
-    def _release_after_use(self, model_id: str) -> None:
+    async def _finish_use(self, model_id: str) -> None:
         """Dynamic modda işlem bittikten sonra boşaltmayı düzenler.
+
+        Kilit ve GPU kuyruğu hâlâ tutulurken çağrılır.
 
         idle_timeout_minutes > 0  -> zamanlayıcı sıfırlanır (boşta kalınca boşalt).
         idle_timeout_minutes = 0  -> kullanım biter bitmez GPU'dan anında boşaltılır;
-        böylece tek GPU'da modelden modele geçişte VRAM hemen açılır.
+        böylece tek GPU'da modelden modele geçişte VRAM, GPU kuyruğu bırakılmadan
+        önce açılır (bir sonraki iş yükleme yapmadan önce yer hazır olur).
+        """
+        if self._mode_for(model_id) != self.MEMORY_DYNAMIC:
+            return
+        self._cancel_idle(model_id)
+        if self.idle_timeout_minutes > 0:
+            self._reschedule_idle(model_id)
+        else:
+            await self._unload_engine_locked(model_id)
+
+    def _schedule_release(self, model_id: str) -> None:
+        """Kilit tutulmadan çağrılan boşaltma planlayıcısı (panel mod değişimi).
+
+        Dinamik+0 modunda boşaltmayı bir göreve bırakır (kilitler dışarıdan
+        alınacağı için); pozitif idle'da zamanlayıcıyı kurar.
         """
         if self._mode_for(model_id) != self.MEMORY_DYNAMIC:
             return
@@ -414,7 +448,7 @@ class ModelManager:
             asyncio.get_running_loop().create_task(self._deferred_unload(model_id))
 
     async def _deferred_unload(self, model_id: str) -> None:
-        """Kilit bırakıldıktan sonra modeli boşaltır (anında boşaltma yolu)."""
+        """Kilit bırakıldıktan sonra modeli boşaltır (panel yolundan)."""
         await asyncio.sleep(0)  # çağıranın kilidini bırakması için bir adım bekle
         # Hâlâ yüklü ve dinamik moddaysa boşalt (arada keep'e geçilmiş olabilir)
         if self._is_loaded(model_id) and self._mode_for(model_id) == self.MEMORY_DYNAMIC:

@@ -20,11 +20,22 @@ import uuid
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Response
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from app import comfy_client, diffusers_backend, hf_downloader, registry, stt_backend, tts_backend
+from app import (
+    comfy_client,
+    diffusers_backend,
+    hf_downloader,
+    plugins,
+    registry,
+    qwen_tts_backend,
+    stt_backend,
+    tts_backend,
+    music_backend,
+    voice_references,
+)
 from app.auth import (
     SESSION_COOKIE,
     authenticate_user,
@@ -35,7 +46,16 @@ from app.auth import (
 from app.comfy_client import ComfyGenerationError, ComfyUnavailableError, get_client
 from app.config import settings
 from app.diffusers_backend import MediaError
+from app.external_llama import (
+    ExternalRuntimeUnavailable,
+    external_runtime_loaded,
+    needs_external_runtime,
+    prism_server_bin,
+    runtime_for,
+    unload_external_runtime,
+)
 from app.gateway import generate_key
+from app.gguf_inspect import GgufReadError, inspect_gguf, runtime_note_for
 from app.model_manager import get_manager
 from app.user_store import SESSION_TTL_DAYS, get_store
 from app.web_tools import is_enabled as web_tools_is_enabled
@@ -121,6 +141,25 @@ class TtsGenerateRequest(BaseModel):
     text: str
     voice: str = ""
     speed: float = 1.0
+    reference_voice_id: str = ""
+    model: str = ""
+    language: str = "Auto"
+    speaker: str = "Ryan"
+    instruct: str = ""
+    reference_text: str = ""
+
+
+
+class MusicGenerateRequest(BaseModel):
+    """Müzik üretim isteği (panel)."""
+
+    model: str = "musicgen-small"
+    prompt: str
+    duration: float = 10.0
+    temperature: float = 0.8
+    top_k: int = 250
+    top_p: float = 0.0
+    response_format: str = "wav"
 
 
 class PanelChatRequest(BaseModel):
@@ -186,20 +225,33 @@ def _model_params(model_id: str) -> str:
 
 # Kategori tahmini: dosya adındaki anahtar sözcükler; bulunamazsa metin modeli
 _CATEGORY_KEYWORDS = {
-    "görsel": ("flux", "sdxl", "stable-diffusion", "realvis", "juggernaut", "dreamshaper"),
-    "ses": ("whisper", "tts", "vits", "piper", "kokoro"),
-    "video": ("wav2lip", "sadtalker", "animatediff", "mochi"),
-    "müzik": ("musicgen", "music", "audiocraft"),
+    "image": ("flux", "sdxl", "stable-diffusion", "realvis", "juggernaut", "dreamshaper"),
+    "stt": ("whisper",),
+    "tts": ("tts", "vits", "piper", "kokoro", "xtts"),
+    "video": ("wav2lip", "sadtalker", "animatediff", "mochi", "wan", "svd"),
+    "music": ("musicgen", "music", "audiocraft"),
+    "vision": ("llava", "vision", "moondream", "qwen-vl", "qwen2-vl"),
 }
 
 
-def _model_category(model_id: str) -> str:
-    """Model kategorisini dosya adından tahmin eder; bilinmiyorsa 'metin'."""
+def _model_category(model_id: str, path=None) -> str:
+    """GGUF modelin iş kategorisini döner (registry sözlüğüyle uyumlu).
+
+    Önce dosya adı işaretleri (görsel/ses/müzik/...) değerlendirilir; aksi
+    hâlde registry.category_for_gguf ile reasoning/chat ayrımına düşülür.
+    """
     low = model_id.lower()
     for category, keywords in _CATEGORY_KEYWORDS.items():
         if any(k in low for k in keywords):
             return category
-    return "metin"
+    if path is not None:
+        try:
+            models_dir = get_manager().models_dir
+        except Exception:
+            return registry.CAT_CHAT
+        return registry.category_for_gguf(model_id, path, models_dir)
+    return registry.CAT_CHAT
+
 
 
 def _set_session_cookie(response: Response, token: str) -> None:
@@ -230,6 +282,16 @@ def _require_setup_not_done() -> None:
 
 def _model_to_dict(model) -> dict:
     """ModelInfo nesnesini panel için sözlüğe çevirir."""
+    runtime = {"engine": "llama-cpp-python", "supported": True, "note": "Stock llama.cpp uyumlu."}
+    try:
+        gguf = inspect_gguf(model.path)
+        runtime["note"] = runtime_note_for(gguf)
+        if gguf.requires_external_runtime:
+            runtime["engine"] = "external-llama-server"
+            runtime["supported"] = prism_server_bin() is not None
+            model.loaded = external_runtime_loaded(model.model_id)
+    except (GgufReadError, OSError, ValueError) as exc:
+        runtime = {"engine": "unknown", "supported": False, "note": str(exc)}
     return {
         "id": model.model_id,
         "path": str(model.path),
@@ -238,9 +300,10 @@ def _model_to_dict(model) -> dict:
         "loaded": model.loaded,
         "memory_mode": model.memory_mode or get_manager().memory_mode,
         "params": _model_params(model.model_id),
-        "category": _model_category(model.model_id),
+        "category": _model_category(model.model_id, model.path),
         "kind": registry.KIND_GGUF,
         "managed": True,
+        "runtime": runtime,
     }
 
 
@@ -364,13 +427,37 @@ def logout(response: Response, session: dict = Depends(get_current_session)):
 # ------------------------------------------------------------------
 
 @router.get("/models")
-def list_panel_models(_: dict = Depends(get_current_session)):
+def list_panel_models(
+    category: str = "",
+    _: dict = Depends(get_current_session),
+):
     """Yerel modelleri durumlarıyla listeler.
 
-    GGUF (metin) modelleri yönetici (yükle/boşalt/bellek modu) ile, tip
-    bazlı modeller (safetensors/onnx/ct2/embeddings) ise yalnızca bilgi
-    amaçlı listelenir; "managed": false ile işaretlenir.
+    Üç kaynak birleştirilir:
+      * GGUF (metin) — yönetici (yükle/boşalt/bellek modu) ile,
+      * tip/kategori bazlı (safetensors/onnx/ct2/embeddings + image/video/
+        music/tts/stt/...) — "managed": false,
+      * kurulu eklentiler (TTS/dudak senkronu/büyütme/onarım/müzik) —
+        "plugin": true.
+
+    category verilirse yalnızca o kategoriye ait kayıtlar döner.
     """
+    models = _collect_panel_models()
+    if category:
+        models = [m for m in models if m.get("category") == category]
+
+    categories = sorted({m.get("category", "") for m in models if m.get("category")})
+    return {"models": models, "categories": categories}
+
+
+_PANEL_MODEL_CATEGORY_ORDER: tuple[str, ...] = (
+    "chat", "reasoning", "image", "video", "music", "tts", "stt",
+    "embedding", "text", "vision", "upscale", "restore", "lipsync", "generic",
+)
+
+
+def _collect_panel_models() -> list[dict]:
+    """Panel model listesini üreten üç kaynağı tek listede toplar."""
     models = [_model_to_dict(m) for m in get_manager().list_models()]
     for entry in registry.scan_typed(models_dir=get_manager().models_dir):
         models.append(
@@ -387,7 +474,33 @@ def list_panel_models(_: dict = Depends(get_current_session)):
                 "managed": False,
             }
         )
-    return {"models": models}
+    models.extend(plugins.plugin_models())
+    return models
+
+
+@router.get("/models/by-category")
+def list_panel_models_by_category(_: dict = Depends(get_current_session)):
+    """Tüm panel modellerini kategori gruplarına ayrılmış şekilde döner.
+
+    Tek endpoint'te her kategori için model listesi verilir; istemci ek
+    sorgu yapmadan kategori -> modeller eşlemesini alır.
+    """
+    models = _collect_panel_models()
+    grouped: dict[str, list[dict]] = {}
+    for model in models:
+        category = model.get("category") or "generic"
+        grouped.setdefault(category, []).append(model)
+
+    ordered = [c for c in _PANEL_MODEL_CATEGORY_ORDER if c in grouped]
+    ordered.extend(sorted(c for c in grouped if c not in ordered))
+
+    return {
+        "object": "list",
+        "grouped": True,
+        "total": len(models),
+        "categories": grouped,
+        "category_order": ordered,
+    }
 
 
 def _find_model(model_id: str):
@@ -401,16 +514,25 @@ def _find_model(model_id: str):
 @router.post("/models/{model_id}/load")
 async def panel_load_model(model_id: str, _: dict = Depends(get_current_session)):
     """Modeli belleğe yükler."""
-    _find_model(model_id)
-    await get_manager().load(model_id)
+    model = _find_model(model_id)
+    if needs_external_runtime(model):
+        try:
+            await runtime_for(model).ensure_started()
+        except ExternalRuntimeUnavailable as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+    else:
+        await get_manager().load(model_id)
     return {"ok": True, "loaded": True}
 
 
 @router.post("/models/{model_id}/unload")
 async def panel_unload_model(model_id: str, _: dict = Depends(get_current_session)):
     """Modeli bellekten boşaltır."""
-    _find_model(model_id)
-    await get_manager().unload(model_id)
+    model = _find_model(model_id)
+    if needs_external_runtime(model):
+        await unload_external_runtime(model_id)
+    else:
+        await get_manager().unload(model_id)
     return {"ok": True, "loaded": False}
 
 
@@ -418,7 +540,19 @@ async def panel_unload_model(model_id: str, _: dict = Depends(get_current_sessio
 async def panel_set_mode(
     model_id: str, req: MemoryModeRequest, _: dict = Depends(get_current_session)
 ):
-    """Tek modelin bellek modunu değiştirir (keep/dynamic)."""
+    """Tek modelin/eklentinin bellek modunu değiştirir (keep/dynamic)."""
+    recipe = plugins.get_plugin(model_id)
+    if recipe is not None:
+        try:
+            mode = plugins.set_memory_mode(recipe, req.memory_mode)
+        except plugins.PluginError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "ok": True,
+            "memory_mode": mode,
+            "plugin": True,
+            "running": plugins.is_running(recipe),
+        }
     _find_model(model_id)
     get_manager().set_memory_mode(model_id, req.memory_mode)
     return {"ok": True, "memory_mode": req.memory_mode}
@@ -431,17 +565,25 @@ async def panel_delete_model(model_id: str, _: dict = Depends(get_current_sessio
     Tip bazlı modeller (safetensors/onnx/ct2/embeddings) bellekte
     tutulmadığından doğrudan klasörleri silinir.
     """
-    model = get_manager().get_model(model_id)
+    manager = get_manager()
+    model = manager.get_model(model_id)
     if model is None:
-        entry = registry.get_typed_entry(model_id, models_dir=get_manager().models_dir)
+        entry = registry.get_typed_entry(model_id, models_dir=manager.models_dir)
         if entry is None:
             raise HTTPException(status_code=404, detail=f"'{model_id}' modeli bulunamadı.")
-        removed = registry.delete_typed_model(model_id, models_dir=get_manager().models_dir)
+        removed = registry.delete_typed_model(model_id, models_dir=manager.models_dir)
         logger.info("Tip bazlı model silindi: %s (%s)", model_id, ", ".join(removed) or "dosya yok")
         return {"ok": True, "removed": removed}
 
-    manager = get_manager()
+    # Harici runtime (Prism/Bonsai) modeli tutuyorsa önce süreci durdur;
+    # aksi halde dosya silinse bile süreç VRAM'i bırakmaz.
+    if needs_external_runtime(model):
+        try:
+            await unload_external_runtime(model_id)
+        except Exception:  # noqa: BLE001 - silme engellenmesin
+            logger.exception("Harici runtime durdurulamadı: %s", model_id)
     removed = await hf_downloader.delete_model(model_id, manager=manager, models_dir=manager.models_dir)
+    manager.forget_memory_mode(model_id)
     logger.info("Model silindi: %s (%s)", model_id, ", ".join(removed) or "dosya yok")
     return {"ok": True, "removed": removed}
 
@@ -470,8 +612,25 @@ async def panel_chat(req: PanelChatRequest, _: dict = Depends(get_current_sessio
         params["max_tokens"] = req.max_tokens
 
     try:
-        answer = await get_manager().chat(req.model, req.messages, **params)
-        usage = await get_manager().usage(req.model)
+        model = get_manager().get_model(req.model)
+        if model is None:
+            raise ValueError(f"'{req.model}' adında bir model bulunamadı")
+        if needs_external_runtime(model):
+            payload = {
+                "model": req.model,
+                "messages": req.messages,
+                "stream": False,
+                **params,
+            }
+            body = await runtime_for(model).post_json("/chat/completions", payload)
+            message = body.get("choices", [{}])[0].get("message", {})
+            answer = message.get("content") or message.get("reasoning_content") or ""
+            usage = body.get("usage") or {}
+        else:
+            answer = await get_manager().chat(req.model, req.messages, **params)
+            usage = await get_manager().usage(req.model)
+    except ExternalRuntimeUnavailable as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -931,7 +1090,14 @@ def comfy_video(prompt_id: str, _: dict = Depends(get_current_session)):
 @router.get("/tts/status")
 async def tts_status_endpoint(_: dict = Depends(get_current_session)):
     """TTS motoru durumu: açık mı, kurulu mu, hangi ses."""
-    return await tts_backend.tts_status()
+    status = await tts_backend.tts_status()
+    models = qwen_tts_backend.list_models()
+    status.update({
+        "enabled": bool(models) or status["enabled"],
+        "local_models": models,
+        "local_engine_installed": Path("runtime/qwen-tts/venv/bin/python").is_file(),
+    })
+    return status
 
 
 @router.post("/tts/generate")
@@ -941,12 +1107,23 @@ async def tts_generate(req: TtsGenerateRequest, _: dict = Depends(get_current_se
 
     key = uuid4().hex[:12]
     try:
-        audio, mime = await tts_backend.synthesize(
-            text=req.text,
-            voice=req.voice,
-            rate=tts_backend._edge_speed_rate(req.speed),
-        )
-    except tts_backend.TTSError as exc:
+        if req.model:
+            audio, mime = await qwen_tts_backend.synthesize(
+                model_id=req.model,
+                text=req.text,
+                language=req.language,
+                speaker=req.speaker,
+                instruct=req.instruct,
+                reference_voice_id=req.reference_voice_id,
+                reference_text=req.reference_text,
+            )
+        else:
+            audio, mime = await tts_backend.synthesize(
+                text=req.text,
+                voice=req.voice,
+                rate=tts_backend._edge_speed_rate(req.speed),
+            )
+    except (tts_backend.TTSError, qwen_tts_backend.LocalTTSError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Ses motoru bağlantı hatası: {exc}")
@@ -964,6 +1141,82 @@ def tts_audio(key: str, _: dict = Depends(get_current_session)):
     return Response(content=audio["bytes"], media_type=audio.get("mime", "audio/mpeg"))
 
 
+@router.get("/music/status")
+async def panel_music_status(_: dict = Depends(get_current_session)):
+    """Müzik motoru durumu."""
+    return await music_backend.music_status()
+
+
+@router.post("/music/generate")
+async def panel_music_generate(req: MusicGenerateRequest, _: dict = Depends(get_current_session)):
+    """Prompt'tan müzik üretir; sonucu depoya yazar ve oynatma URL'si döner."""
+    from uuid import uuid4
+
+    key = uuid4().hex[:12]
+    try:
+        audio, mime = await music_backend.generate_music(
+            prompt=req.prompt,
+            model=req.model,
+            duration=req.duration,
+            temperature=req.temperature,
+            top_k=req.top_k,
+            top_p=req.top_p,
+            response_format=req.response_format,
+        )
+    except music_backend.MusicError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Müzik üretim hatası: {exc}")
+
+    music_backend.store_music_audio(key, audio, mime)
+    return {"ok": True, "key": key, "url": f"/panel/music/audio/{key}", "mime_type": mime}
+
+
+@router.get("/music/audio/{key}")
+def panel_music_audio(key: str, _: dict = Depends(get_current_session)):
+    """Üretilen müziği panel içinde oynatılmak üzere sunar."""
+    audio = music_backend.get_stored_music_audio(key)
+    if audio is None:
+        raise HTTPException(status_code=404, detail="Müzik bulunamadı (depo temizlenmiş olabilir).")
+    return Response(content=audio["bytes"], media_type=audio.get("mime", "audio/wav"))
+
+
+@router.get("/tts/voice-references")
+def list_voice_references(_: dict = Depends(get_current_session)):
+    """Kayıtlı klonlama referans seslerini listeler."""
+    return {"references": voice_references.list_all(), "max_bytes": voice_references.MAX_VOICE_REFERENCE_BYTES}
+
+
+@router.post("/tts/voice-references")
+async def upload_voice_reference(
+    file: UploadFile = File(...), _: dict = Depends(get_current_session)
+):
+    """En fazla 30 MB büyüklüğünde bir klonlama referans sesi kaydeder."""
+    payload = await file.read(voice_references.MAX_VOICE_REFERENCE_BYTES + 1)
+    try:
+        item = voice_references.save(file.filename or "reference-audio", file.content_type or "", payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "reference": item}
+
+
+@router.get("/tts/voice-references/{reference_id}/audio")
+def voice_reference_audio(reference_id: str, _: dict = Depends(get_current_session)):
+    found = voice_references.get(reference_id)
+    if found is None:
+        raise HTTPException(status_code=404, detail="Referans ses bulunamadı.")
+    meta, path = found
+    return FileResponse(path, media_type=meta.get("content_type"), filename=meta.get("name"))
+
+
+@router.delete("/tts/voice-references/{reference_id}")
+def delete_voice_reference(reference_id: str, _: dict = Depends(get_current_session)):
+    """Referans kaydını ve fiziksel ses dosyasını birlikte siler."""
+    if not voice_references.delete(reference_id):
+        raise HTTPException(status_code=404, detail="Referans ses bulunamadı.")
+    return {"ok": True, "deleted": reference_id}
+
+
 # ------------------------------------------------------------------
 # Oturum korumalı: STT paneli (spch-to-text)
 # ------------------------------------------------------------------
@@ -971,33 +1224,40 @@ def tts_audio(key: str, _: dict = Depends(get_current_session)):
 @router.get("/stt/status")
 async def stt_status_endpoint(_: dict = Depends(get_current_session)):
     """STT motoru durumu: açık mı, kurulu mu, varsayılan model."""
-    return await stt_backend.stt_status()
-
-
-class TranscribeRequest(BaseModel):
-    """Panel STT isteği: Transkripsiyonu depoda sakla."""
-    model: str = Field(default="base", description="Model adı (base, small, medium, large-v2...)")
-    language: Optional[str] = Field(default=None, description="Dil kodu (örn: 'tr', 'en')")
-    prompt: Optional[str] = Field(default=None, description="İpucu metni")
-    language: Optional[str] = Field(default="tr", description="Transkripsiyon için dil kodu (örn: 'tr', 'en')")
+    status = await stt_backend.stt_status()
+    status["models"] = [
+        entry.model_id
+        for entry in registry.scan_typed(models_dir=get_manager().models_dir)
+        if entry.category == registry.CAT_STT
+    ]
+    return status
 
 
 @router.post("/stt/transcribe")
-async def stt_transcribe(req: TranscribeRequest, _: dict = Depends(get_current_session)):
-    """Panel STT: Dosyayı panel deposunda transkripsiyonu ile saklar (içeri görüntülenebilir)."""
-    from uuid import uuid4
-    import os
-    
-    key = uuid4().hex[:12]
-    
-    # Kurulu boşluğa dönüştürücüyü önbelleğele
-    if not hasattr(stt_backend, "_model"):
-        await stt_backend.transcribe_audio.__wrapped__(stt_backend, b"", model="base")
-    
-    # Depoya kaydet
-    await stt_backend.store_transcription(key, req.language or "tr")
-    
-    return {"ok": True, "key": key, "language": req.language or "tr"}
+async def stt_transcribe(
+    file: UploadFile = File(...),
+    model: str = Form("base"),
+    language: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
+    response_format: str = Form("json"),
+    _: dict = Depends(get_current_session),
+):
+    """Panelden yüklenen ses dosyasını gerçek STT motoruyla metne çevirir."""
+    payload = await file.read(voice_references.MAX_VOICE_REFERENCE_BYTES + 1)
+    if len(payload) > voice_references.MAX_VOICE_REFERENCE_BYTES:
+        raise HTTPException(status_code=400, detail="Ses dosyası en fazla 30 MB olabilir.")
+    if not payload:
+        raise HTTPException(status_code=400, detail="Ses dosyası boş olamaz.")
+    try:
+        return await stt_backend.transcribe_audio(
+            audio_bytes=payload,
+            model=model,
+            language=language or None,
+            prompt=prompt or None,
+            response_format=response_format,
+        )
+    except stt_backend.STTError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/stt/transcriptions/{key}")
@@ -1007,6 +1267,117 @@ async def stt_transcription(key: str, _: dict = Depends(get_current_session)):
     if transcription is None:
         raise HTTPException(status_code=404, detail="Transkripsiyon bulunamadı (depo temizlenmiş olabilir).")
     return {"key": key, "text": transcription["text"], "language": transcription.get("language", "tr")}
+
+
+# ------------------------------------------------------------------
+# Oturum korumalı: Eklentiler (harici teknolojiler)
+# ------------------------------------------------------------------
+
+def _plugin_or_404(plugin_id: str):
+    """Eklenti tarifini bulur; yoksa 404 verir."""
+    recipe = plugins.get_plugin(plugin_id)
+    if recipe is None:
+        raise HTTPException(status_code=404, detail=f"'{plugin_id}' eklentisi bulunamadı.")
+    return recipe
+
+
+@router.get("/plugins")
+def panel_plugins(_: dict = Depends(get_current_session)):
+    """Kurulabilir eklentileri ve kurulum/çalışma durumlarını listeler.
+
+    Her kayıt kategori (tts/lipsync/upscale), beklenen Python sürümü,
+    sunduğu /v1 uç noktası, disk/VRAM ihtiyacı, 'installed' ve 'running'
+    bayraklarını taşır. Panel bu bilgiyle düğmeleri gösterip gizler.
+    """
+    return {"plugins": plugins.list_plugins()}
+
+
+@router.post("/plugins/{plugin_id}/install")
+async def panel_plugin_install(plugin_id: str, _: dict = Depends(get_current_session)):
+    """Eklenti kurulumunu arka planda başlatır."""
+    recipe = _plugin_or_404(plugin_id)
+    try:
+        plugins.install(recipe)
+    except plugins.PluginError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "plugin_id": plugin_id, "status": "installing"}
+
+
+@router.post("/plugins/{plugin_id}/install/cancel")
+def panel_plugin_install_cancel(plugin_id: str, _: dict = Depends(get_current_session)):
+    """Süren eklenti kurulumunu iptal eder (süreç + indirme durdurulur)."""
+    recipe = _plugin_or_404(plugin_id)
+    if not plugins.cancel_install(recipe):
+        raise HTTPException(status_code=409, detail="Bu eklenti için süren bir kurulum yok.")
+    return {"ok": True, "plugin_id": plugin_id, "status": "cancelling"}
+
+
+@router.get("/plugins/{plugin_id}/install/status")
+def panel_plugin_install_status(plugin_id: str, _: dict = Depends(get_current_session)):
+    """Devam eden kurulumun adım/ilerleme durumunu döner (panel yoklar)."""
+    recipe = _plugin_or_404(plugin_id)
+    status = plugins.install_status(plugin_id) or {}
+    return {
+        "plugin_id": plugin_id,
+        "installing": bool(status.get("running")),
+        "done": bool(status.get("done")),
+        "cancelled": bool(status.get("cancelled")),
+        "step": status.get("step", ""),
+        "step_index": int(status.get("step_index") or 0),
+        "step_total": int(status.get("step_total") or 0),
+        "received": int(status.get("received") or 0),
+        "total": int(status.get("total") or 0),
+        "pct": status.get("pct"),
+        "error": status.get("error"),
+        "installed": plugins.is_installed(recipe),
+    }
+
+
+@router.post("/plugins/{plugin_id}/start")
+def panel_plugin_start(plugin_id: str, _: dict = Depends(get_current_session)):
+    """Eklenti servisini başlatır."""
+    recipe = _plugin_or_404(plugin_id)
+    try:
+        return plugins.start(recipe)
+    except plugins.PluginError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/plugins/{plugin_id}/stop")
+def panel_plugin_stop(plugin_id: str, _: dict = Depends(get_current_session)):
+    """Eklenti servisini durdurur."""
+    recipe = _plugin_or_404(plugin_id)
+    try:
+        return plugins.stop(recipe)
+    except plugins.PluginError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/plugins/{plugin_id}/restart")
+def panel_plugin_restart(plugin_id: str, _: dict = Depends(get_current_session)):
+    """Eklenti servisini yeniden başlatır."""
+    recipe = _plugin_or_404(plugin_id)
+    try:
+        return plugins.restart(recipe)
+    except plugins.PluginError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/plugins/{plugin_id}/log")
+def panel_plugin_log(
+    plugin_id: str, kind: str = "service", _: dict = Depends(get_current_session)
+):
+    """Eklentinin servis ya da kurulum logunu döner (panometrede gösterilir)."""
+    recipe = _plugin_or_404(plugin_id)
+    log_kind = "install" if kind == "install" else "service"
+    return {"plugin_id": plugin_id, "kind": log_kind, "text": plugins.read_log(recipe, log_kind)}
+
+
+@router.delete("/plugins/{plugin_id}")
+def panel_plugin_remove(plugin_id: str, _: dict = Depends(get_current_session)):
+    """Eklentiyi tamamen kaldırır (servis + ortam + ağırlıklar)."""
+    recipe = _plugin_or_404(plugin_id)
+    return plugins.remove(recipe)
 
 
 # ------------------------------------------------------------------

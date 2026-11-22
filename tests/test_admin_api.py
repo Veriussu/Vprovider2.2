@@ -537,6 +537,80 @@ def test_panel_lists_typed_models(tmp_path, monkeypatch):
     assert by_id["embed-model"]["category"] == "embedding"
 
 
+def test_panel_gguf_category_uses_registry_vocabulary(tmp_path, monkeypatch):
+    """GGUF model kategori sözlüğü registry ile uyumludur (metin değil chat)."""
+    client, _ = _make_client(tmp_path, monkeypatch)
+    _login(client)
+
+    models = client.get("/panel/models").json()["models"]
+    by_id = {m["id"]: m for m in models}
+
+    assert by_id["ornek-model"]["category"] in ("chat", "reasoning")
+
+
+def test_panel_models_category_filter(tmp_path, monkeypatch):
+    """category parametresi yalnızca o kategoriyi süzer; categories alanı da döner."""
+    client, _ = _make_client(tmp_path, monkeypatch)
+    _login(client)
+
+    emb = tmp_path / "models" / "embeddings" / "embed-model"
+    emb.mkdir(parents=True)
+    (emb / "config.json").write_text("{}", "utf-8")
+    (emb / "model.safetensors").write_bytes(b"x")
+
+    body = client.get("/panel/models", params={"category": "embedding"}).json()
+
+    assert [m["id"] for m in body["models"]] == ["embed-model"]
+    assert body["categories"] == ["embedding"]
+
+
+def test_panel_models_includes_plugins(tmp_path, monkeypatch):
+    """list_panel_models kurulu eklentileri plugin kartı olarak ekler."""
+    client, _ = _make_client(tmp_path, monkeypatch)
+    _login(client)
+    monkeypatch.setattr(admin_api.plugins, "plugin_models", lambda: [{
+        "id": "xtts_v2", "name": "XTTS v2", "path": "", "size_bytes": 0,
+        "category": "tts", "kind": "plugin", "plugin": True, "managed": True,
+        "loaded": False, "api": "POST /v1/audio/speech", "running": True,
+    }])
+
+    models = client.get("/panel/models").json()["models"]
+    by_id = {m["id"]: m for m in models}
+
+    assert by_id["xtts_v2"]["plugin"] is True
+    assert by_id["xtts_v2"]["category"] == "tts"
+
+
+
+def test_panel_models_by_category_groups_models(tmp_path, monkeypatch):
+    """by-category uç noktası modelleri kategori sözlüğüne gruplar."""
+    client, _ = _make_client(tmp_path, monkeypatch)
+    _login(client)
+    monkeypatch.setattr(admin_api.plugins, "plugin_models", lambda: [{
+        "id": "xtts_v2", "name": "XTTS v2", "path": "", "size_bytes": 0,
+        "category": "tts", "kind": "plugin", "plugin": True, "managed": True,
+        "loaded": False, "api": "POST /v1/audio/speech", "running": True,
+    }])
+
+    emb = tmp_path / "models" / "embeddings" / "embed-model"
+    emb.mkdir(parents=True)
+    (emb / "config.json").write_text("{}", "utf-8")
+    (emb / "model.safetensors").write_bytes(b"x")
+
+    body = client.get("/panel/models/by-category").json()
+
+    assert body["grouped"] is True
+    assert body["categories"]["tts"][0]["id"] == "xtts_v2"
+    assert any(m["id"] == "embed-model" for m in body["categories"]["embedding"])
+    assert "tts" in body["category_order"]
+    assert "embedding" in body["category_order"]
+    assert body["total"] >= 2
+
+
+def test_panel_models_by_category_requires_auth(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch)[0]
+    resp = client.get("/panel/models/by-category")
+    assert resp.status_code == 401
 def test_panel_search_typed_kind(tmp_path, monkeypatch):
     """Arama uç noktası kind=embeddings iken tip bazlı aramayı kullanır."""
     client, _ = _make_client(tmp_path, monkeypatch)
@@ -619,3 +693,34 @@ def test_panel_delete_unknown_model_404(tmp_path, monkeypatch):
     client, _ = _make_client(tmp_path, monkeypatch)
     _login(client)
     assert client.post("/panel/models/yok-model/delete").status_code == 404
+
+
+def test_panel_delete_external_model_stops_runtime_first(tmp_path, monkeypatch):
+    """Harici runtime modeli silinirken önce süreç durdurulur, sonra dosya silinir."""
+    client, _ = _make_client(tmp_path, monkeypatch)
+    _login(client)
+    manager = admin_api.get_manager()
+    calls = []
+    monkeypatch.setattr(admin_api, "needs_external_runtime", lambda model: True)
+    manager.forget_memory_mode = lambda model_id: calls.append(("forget", model_id))
+
+    async def fake_unload(model_id):
+        calls.append(("stop", model_id))
+        return True
+
+    async def fake_delete(model_id, manager=None, models_dir=None):
+        calls.append(("delete", model_id))
+        return ["ornek-model.gguf"]
+
+    monkeypatch.setattr(admin_api, "unload_external_runtime", fake_unload)
+    monkeypatch.setattr(hf_downloader, "delete_model", fake_delete)
+
+    resp = client.post("/panel/models/ornek-model/delete")
+
+    assert resp.status_code == 200
+    assert resp.json()["removed"] == ["ornek-model.gguf"]
+    assert calls == [
+        ("stop", "ornek-model"),
+        ("delete", "ornek-model"),
+        ("forget", "ornek-model"),
+    ]

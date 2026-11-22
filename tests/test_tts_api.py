@@ -20,6 +20,19 @@ from app.user_store import UserStore
 TEST_API_KEY = "ses-test-anahtar"
 
 
+def _wav(seconds=1.0, sr=24000) -> bytes:
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(b"\x00\x00" * int(sr * seconds))
+    return buf.getvalue()
+
+
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     """API anahtarlı hazır test ortamı."""
@@ -66,6 +79,40 @@ def test_speech_rejects_non_mp3_format(client):
     monkeypatch.undo()
     assert r.status_code == 400
     assert r.json()["error"]["param"] == "response_format"
+
+
+def test_speech_plugin_engine_returns_wav(client, monkeypatch):
+    """model='xtts' ile eklenti motoru seçilir ve WAV döner."""
+    _enable_tts(monkeypatch)
+    wav = _wav(1.0, 24000)
+
+    async def fake_plugin(text, language="en", reference_path="", reference_b64=""):
+        return wav, "audio/wav"
+
+    monkeypatch.setattr(tts_backend, "_synthesize_plugin", fake_plugin)
+    r = client.post(
+        "/v1/audio/speech",
+        json={"input": "merhaba", "model": "xtts", "response_format": "wav"},
+        headers=_auth(),
+    )
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("audio/wav")
+    assert r.content == wav
+
+
+def test_speech_plugin_not_running_returns_400(client, monkeypatch):
+    """Çalışan TTS eklentisi yoksa eklenti motoru 400 verir."""
+    from app import plugins
+
+    _enable_tts(monkeypatch)
+    monkeypatch.setattr(plugins, "running_port_for_category", lambda category, prefer=(): None)
+    r = client.post(
+        "/v1/audio/speech",
+        json={"input": "merhaba", "model": "plugin", "response_format": "wav"},
+        headers=_auth(),
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "speech_failed"
 
 
 def test_speech_success_returns_audio_bytes(client, monkeypatch):

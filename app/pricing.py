@@ -33,6 +33,9 @@ DEFAULT_PRICES: dict[str, dict] = {
     "tts":        {"token_1k": 0.0,     "per_image": 0.0, "per_video": 0.0, "per_audio_sec": 0.0005, "per_music": 0.0},
     "stt":        {"token_1k": 0.002,   "per_image": 0.0, "per_video": 0.0, "per_audio_sec": 0.0, "per_music": 0.0},
     "music":      {"token_1k": 0.0,     "per_image": 0.0, "per_video": 0.0, "per_audio_sec": 0.0, "per_music": 0.05},
+    "upscale":    {"token_1k": 0.0,     "per_image": 0.02, "per_video": 0.0, "per_audio_sec": 0.0, "per_music": 0.0},
+    "restore":    {"token_1k": 0.0,     "per_image": 0.0, "per_video": 0.5, "per_audio_sec": 0.0, "per_music": 0.0},
+    "lipsync":    {"token_1k": 0.0,     "per_image": 0.0, "per_video": 0.3, "per_audio_sec": 0.0, "per_music": 0.0},
 }
 
 # Bilinmeyen görevler chat tarifesiyle fiyatlanır (zararsız varsayılan).

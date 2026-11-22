@@ -22,6 +22,7 @@
 # ─────────────────────────────────────────────────────────────
 
 import json
+import logging
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -29,6 +30,8 @@ from pathlib import Path
 from typing import Optional
 
 from app.config import settings
+
+logger = logging.getLogger("vprovider")
 
 # Model biçimi sabitleri (HF indiriciyle aynı adlandırma)
 KIND_GGUF = "gguf"
@@ -171,16 +174,62 @@ def _is_embedding_model(model_dir: Path) -> bool:
     )
 
 
+def _detect_format(model_dir: Path) -> Optional[str]:
+    """Bir model dizininin biçimini (kind) çıkarır; bilinmezse None."""
+    if _is_safetensors_pipeline(model_dir):
+        return KIND_SAFETENSORS
+    if _is_onnx_model(model_dir):
+        return KIND_ONNX
+    if _is_ct2_model(model_dir):
+        return KIND_CT2
+    if _is_embedding_model(model_dir):
+        return KIND_EMBEDDINGS
+    return None
+
+
+# Kategori klasörleri: models/ altında her biri bir iş kategorisidir.
+# İçlerindeki modellerin biçimi (safetensors/onnx/ct2/embeddings) otomatik
+# algılanır; kategori klasör adından gelir (indirirken de aynı ad kullanılır).
+_CATEGORY_SUBDIRS: dict[str, str] = {
+    "image": CAT_IMAGE,
+    "video": CAT_VIDEO,
+    "music": CAT_MUSIC,
+    "tts": "tts",
+    "stt": CAT_STT,
+    "text": "text",
+    "vision": "vision",
+    "restore": "restore",
+    "upscale": "upscale",
+    "lipsync": "lipsync",
+}
+
+
 def scan_typed(models_dir: Optional[Path | str] = None) -> list[ModelEntry]:
     """Yalnızca tip bazlı (GGUF dışı) modelleri tarar.
 
-    Sözleşmeye uygun alt klasörleri (safetensors/onnx/ct2/embeddings)
-    inceler. GGUF listesi burada değil, model yöneticisindedir.
+    İki sözleşme taranır:
+      * biçim klasörleri (safetensors/onnx/ct2/embeddings) — kategori
+        modelin içeriğinden çıkarılır,
+      * kategori klasörleri (image/video/music/tts/stt/text/vision/
+        restore/upscale/lipsync) — kategori klasör adından gelir, biçim
+        otomatik algılanır.
+    GGUF listesi burada değil, model yöneticisindedir.
     """
     models_dir = Path(models_dir or settings.models_dir)
     if not models_dir.exists():
         return []
     entries: list[ModelEntry] = []
+
+    def _add(model_dir: Path, kind: str, category: str) -> None:
+        entries.append(
+            ModelEntry(
+                model_id=model_dir.name,
+                kind=kind,
+                category=category,
+                path=model_dir,
+                size_bytes=_dir_size(model_dir),
+            )
+        )
 
     def _scan_dir(kind: str, subdir: str, detect, category_for) -> None:
         base = models_dir / subdir
@@ -194,21 +243,32 @@ def scan_typed(models_dir: Optional[Path | str] = None) -> list[ModelEntry]:
                     continue
             except Exception:
                 continue
-            category = category_for(model_dir)
-            entries.append(
-                ModelEntry(
-                    model_id=model_dir.name,
-                    kind=kind,
-                    category=category,
-                    path=model_dir,
-                    size_bytes=_dir_size(model_dir),
-                )
-            )
+            _add(model_dir, kind, category_for(model_dir))
 
+    # Biçim klasörleri (eski sözleşme)
     _scan_dir(KIND_SAFETENSORS, KIND_SAFETENSORS, _is_safetensors_pipeline, _safetensors_category)
     _scan_dir(KIND_ONNX, KIND_ONNX, _is_onnx_model, lambda _d: CAT_GENERIC)
     _scan_dir(KIND_CT2, KIND_CT2, _is_ct2_model, lambda _d: CAT_STT)
     _scan_dir(KIND_EMBEDDINGS, KIND_EMBEDDINGS, _is_embedding_model, lambda _d: CAT_EMBEDDING)
+
+    # Kategori klasörleri (yeni sözleşme): biçim otomatik algılanır
+    seen = {e.path for e in entries}
+    for subdir, category in _CATEGORY_SUBDIRS.items():
+        base = models_dir / subdir
+        if not base.is_dir():
+            continue
+        for model_dir in sorted(base.iterdir()):
+            if not model_dir.is_dir() or model_dir.name.startswith("."):
+                continue
+            if model_dir in seen:
+                continue
+            try:
+                kind = _detect_format(model_dir)
+            except Exception:
+                kind = None
+            if kind is None:
+                continue
+            _add(model_dir, kind, category)
     return entries
 
 
@@ -273,20 +333,28 @@ def get_entry(model_id: str, manager=None, models_dir: Optional[Path | str] = No
 # ------------------------------------------------------------------
 
 def delete_typed_model(model_id: str, models_dir: Optional[Path | str] = None) -> list[str]:
-    """models/<kind>/<model_id> klasörünü siler (varsa).
+    """Bir tip bazlı modelin dizinini siler (varsa).
 
     GGUF tipi model yöneticisi + hf_downloader tarafından yönetilir;
-    bu işlev yalnızca tip bazlı (safetensors/onnx/ct2/embeddings) dizinleri
+    bu işlev yalnızca tip bazlı (safetensors/onnx/ct2/embeddings) ve
+    kategori klasörlerindeki (image/video/music/tts/...) dizinleri
     temizler. Silinen kayıt yollarını döner.
     """
     models_dir = Path(models_dir or settings.models_dir)
+    root = models_dir.resolve()
     removed: list[str] = []
-    for kind, subdir in KIND_SUBDIRS.items():
-        target = models_dir / subdir / model_id
-        if target.is_dir():
+    subdirs = list(KIND_SUBDIRS.values()) + list(_CATEGORY_SUBDIRS)
+    for subdir in subdirs:
+        target = (models_dir / subdir / model_id)
+        # model_id bir yol bileşeni olsa da models/ ağacının dışına çıkamasın
+        resolved = target.resolve()
+        if resolved == root or root not in resolved.parents:
+            logger.warning("Model silme reddedildi (models/ dışında): %s", target)
+            continue
+        if resolved.is_dir():
             try:
-                shutil.rmtree(target)
-                removed.append(str(target))
+                shutil.rmtree(resolved)
+                removed.append(str(resolved))
             except OSError:
-                pass
+                logger.exception("Tip bazlı model silinemedi: %s", resolved)
     return removed

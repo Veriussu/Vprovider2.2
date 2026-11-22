@@ -19,6 +19,9 @@
 # ─────────────────────────────────────────────────────────────
 
 import asyncio
+import fnmatch
+import logging
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -29,6 +32,7 @@ from typing import Callable, Optional
 
 import httpx
 from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub.errors import HfHubHTTPError
 
 from app.config import settings
 from app.registry import (  # noqa: F401  (registry.KIND_* sabitini yeniden dışa aktarır)
@@ -39,6 +43,8 @@ from app.registry import (  # noqa: F401  (registry.KIND_* sabitini yeniden dı�
     KIND_SAFETENSORS,
 )
 
+logger = logging.getLogger("vprovider")
+
 # Varsayılan nicelik (quantization): tercihen bu desen bulunur
 DEFAULT_QUANT = "Q4_K_M"
 # İndirme parça boyutu (1 MB)
@@ -47,6 +53,10 @@ _CHUNK_SIZE = 1024 * 1024
 _REQUEST_TIMEOUT = 60.0
 # Katalog (browse) önbellek süresi: ilk sorgu ağır, tekrar anında
 _BROWSE_TTL = 600  # saniye
+
+# HuggingFace hız sınırı (429) için yeniden deneme
+_RATE_LIMIT_RETRIES = 3
+_RATE_LIMIT_BACKOFF = 2.0  # saniye (katlanarak artar)
 
 # İlerleme kaydı ve aktif indirme kilidi
 _downloads: dict[str, dict] = {}
@@ -62,6 +72,38 @@ _browse_lock = threading.Lock()
 
 class DownloadCancelledError(Exception):
     """İndirme kullanıcı tarafından iptal edildi."""
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    """Hatanın HuggingFace hız sınırı (429) olup olmadığını döner."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status == 429:
+        return True
+    if isinstance(exc, HfHubHTTPError):
+        return "429" in str(exc)
+    return False
+
+
+def _hf_retry(fn: Callable, *args, **kwargs):
+    """HF çağrısını hız sınırında (429) katlanan bekleme ile yeniden dener.
+
+    Diğer hatalar olduğu gibi yükseltilir; denemeler tükenirse son 429
+    hatası yükseltilir.
+    """
+    delay = _RATE_LIMIT_BACKOFF
+    last: Exception | None = None
+    for attempt in range(_RATE_LIMIT_RETRIES + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            if not _is_rate_limited(exc) or attempt >= _RATE_LIMIT_RETRIES:
+                last = exc
+                break
+            time.sleep(delay)
+            delay *= 2
+    if last is not None:
+        raise last
+    return fn(*args, **kwargs)
 
 
 # ------------------------------------------------------------------
@@ -168,7 +210,7 @@ def search_models(
 def _repo_gguf_files(repo_id: str, token: Optional[str] = None) -> list[str]:
     """Repo'daki .gguf dosya adlarını döner (yoksa / hata varsa boş liste)."""
     try:
-        files = _api(token).list_repo_files(repo_id)
+        files = _hf_retry(_api(token).list_repo_files, repo_id)
     except Exception:
         return []
     return [f for f in files if f.endswith(".gguf") and not f.startswith(".")]
@@ -194,29 +236,68 @@ def _repo_gguf_count(repo_id: str, token: Optional[str] = None) -> int:
 # Tip bazlı arama (GGUF dışı: safetensors/onnx/ct2/embeddings)
 # ------------------------------------------------------------------
 
-# Biçim -> HuggingFace kitaplık etiketi (list_models'da filtre)
-KIND_LIBRARIES: dict[str, str] = {
-    KIND_SAFETENSORS: "diffusers",
-    KIND_ONNX: "onnx",
-    KIND_CT2: "ctranslate2",
-    KIND_EMBEDDINGS: "sentence-transformers",
+# ------------------------------------------------------------------
+# Etiket -> hedef eşlemesi
+# ------------------------------------------------------------------
+# Paneldeki "Model Ekle" açılır listesi iki tür etiket sunar:
+#   * biçim etiketleri (safetensors/onnx/ct2/embeddings) — dosya biçimini seçer
+#   * kategori etiketleri (image/video/tts/stt/music/text/vision) — işi seçer
+# Her etiket üç şeyi belirler: HF arama filtresi, indirme biçimi ve
+# models/ altına kurulacak klasör. "by" alanı filtre türünü verir:
+#   library -> api.list_models(filter=...)   (kitaplık etiketi)
+#   pipeline -> api.list_models(pipeline_tag=...) (iş etiketi)
+_TARGETS: dict[str, tuple[str, str, str, str, tuple[str, ...]]] = {
+    # Biçim etiketleri (geriye dönük uyum)
+    KIND_SAFETENSORS: ("library", "diffusers", KIND_SAFETENSORS, KIND_SAFETENSORS, (".safetensors",)),
+    KIND_ONNX: ("library", "onnx", KIND_ONNX, KIND_ONNX, (".onnx",)),
+    KIND_CT2: ("library", "ctranslate2", KIND_CT2, KIND_CT2, (".bin",)),
+    KIND_EMBEDDINGS: ("library", "sentence-transformers", KIND_EMBEDDINGS, KIND_EMBEDDINGS, (".safetensors", ".bin", ".onnx")),
+    # Kategori etiketleri
+    "image": ("pipeline", "text-to-image", KIND_SAFETENSORS, "image", (".safetensors",)),
+    "video": ("pipeline", "text-to-video", KIND_SAFETENSORS, "video", (".safetensors",)),
+    "music": ("pipeline", "text-to-audio", KIND_SAFETENSORS, "music", (".safetensors", ".bin")),
+    "tts": ("pipeline", "text-to-speech", KIND_SAFETENSORS, "tts", (".safetensors", ".bin")),
+    "stt": ("pipeline", "automatic-speech-recognition", KIND_CT2, "stt", (".bin", ".safetensors")),
+    "text": ("library", "text-generation", KIND_SAFETENSORS, "text", (".safetensors", ".bin")),
+    "vision": ("pipeline", "image-text-to-text", KIND_SAFETENSORS, "vision", (".safetensors",)),
 }
+
+# Arayüzde gösterilecek etiket sırası (panel açılır listesi)
+CATEGORY_LABELS_ORDER: tuple[str, ...] = (
+    "gguf", "image", "video", "music", "tts", "stt", "text", "vision",
+    "embeddings", "safetensors", "ct2", "onnx",
+)
+
+
+# Etiket -> (indirme biçimi, hedef klasör, dosya ipuçları)
+def target_for(label: str) -> tuple[str, str, tuple[str, ...]]:
+    """Bir panel etiketinin (indirme biçimi, hedef klasör, dosya ipuçları) üçlüsü."""
+    entry = _TARGETS.get(label)
+    if entry is None:
+        raise ValueError(f"Bilinmeyen model etiketi: '{label}'")
+    _by, _filter, format_, subdir, hints = entry
+    return format_, subdir, hints
+
+
+def _format_of(label: str) -> str:
+    """Etiketin indirme biçimini döner (gguf hariç her etiket için)."""
+    return target_for(label)[0]
+
+
+def _subdir_of(label: str) -> str:
+    """Etiketin models/ altına kurulacağı klasör adını döner."""
+    return target_for(label)[1]
 
 
 def _kind_file_hint(kind: str) -> tuple[str, ...]:
-    """Bir biçimin repo içinde aranacak dosya ipuçları."""
-    return {
-        KIND_SAFETENSORS: (".safetensors",),
-        KIND_ONNX: (".onnx",),
-        KIND_CT2: (".bin",),
-        KIND_EMBEDDINGS: (".safetensors", ".bin", ".onnx"),
-    }.get(kind, ())
+    """Bir etiketin repo içinde aranacak dosya ipuçları."""
+    return target_for(kind)[2]
 
 
 def _repo_kind_files(repo_id: str, kind: str, token: Optional[str] = None) -> list[str]:
     """Repo'da verilen biçime uyan dosya adlarını döner (hata/boşsa [])."""
     try:
-        files = _api(token).list_repo_files(repo_id)
+        files = _hf_retry(_api(token).list_repo_files, repo_id)
     except Exception:
         return []
     hints = _kind_file_hint(kind)
@@ -227,7 +308,7 @@ def _repo_kind_files(repo_id: str, kind: str, token: Optional[str] = None) -> li
 
 def get_kind_files(repo_id: str, kind: str = KIND_GGUF, token: Optional[str] = None) -> list[str]:
     """Repo'daki belirli biçime uyan dosya adlarını döner (GGUF dahil)."""
-    if kind == KIND_GGUF:
+    if kind == "gguf":
         return _repo_gguf_files(repo_id, token)
     return _repo_kind_files(repo_id, kind, token)
 
@@ -263,9 +344,17 @@ def _safetensors_allow_patterns(repo_files: list[str]) -> Optional[list[str]]:
     return [prefix, *_SAFETENSORS_CONFIG_FILES]
 
 
-def _snapshot_filters(kind: str, repo_id: str, token: Optional[str]) -> tuple:
-    """snapshot_download için (allow_patterns, ignore_patterns) üretir."""
-    if kind != KIND_SAFETENSORS:
+def _snapshot_filters(label: str, repo_id: str, token: Optional[str]) -> tuple:
+    """snapshot_download için (allow_patterns, ignore_patterns) üretir.
+
+    Etiket önce indirme biçimine çevrilir; yalnız safetensors biçimindeki
+    depolar dosya deseniyle kısaltılır (fp16/onnx/medya dışlanır).
+    """
+    try:
+        format_ = _format_of(label)
+    except ValueError:
+        return None, None
+    if format_ != KIND_SAFETENSORS:
         return None, None
     try:
         repo_files = _api(token).list_repo_files(repo_id)
@@ -274,18 +363,29 @@ def _snapshot_filters(kind: str, repo_id: str, token: Optional[str]) -> tuple:
     return _safetensors_allow_patterns(repo_files), _SNAPSHOT_IGNORE_PATTERNS
 
 
-def _list_models_by_library(api, library: str, query: str, scan_max: int) -> list:
-    """Kütüphane etiketine göre model listeler (hub sürümüne uyumlu).
+def _list_models_by_filter(api, label: str, query: str, scan_max: int) -> list:
+    """Bir etikete göre model listeler.
 
-    huggingface_hub 1.x kütüphane filtresini "filter" ile alır; 0.x ise
-    "library" anahtarını kullanır. Önce yeni biçim denenir, TypeError
-    gelirse eski biçime düşülür.
+    Etiketin "by" alanı (library/pipeline) hangi HF parametresinin
+    kullanılacağını belirler; huggingface_hub sürüm farkına göre iki
+    biçim denenir (filter/library, pipeline_tag). Hız sınırında (429)
+    katlanan bekleme ile yeniden denenir.
     """
+    entry = _TARGETS.get(label)
+    if entry is None:
+        raise ValueError(f"Bilinmeyen model etiketi: '{label}'")
+    by, value = entry[0], entry[1]
     kwargs = {"search": query or None, "sort": "downloads", "limit": scan_max}
+    if by == "pipeline":
+        try:
+            return list(_hf_retry(api.list_models, pipeline_tag=value, **kwargs))
+        except TypeError:
+            kwargs["filter"] = value
+            return list(_hf_retry(api.list_models, **kwargs))
     try:
-        return list(api.list_models(filter=library, **kwargs))
+        return list(_hf_retry(api.list_models, filter=value, **kwargs))
     except TypeError:
-        return list(api.list_models(library=library, **kwargs))
+        return list(_hf_retry(api.list_models, library=value, **kwargs))
 
 
 def search_kind(
@@ -294,34 +394,48 @@ def search_kind(
     limit: int = 24,
     scan_max: int = 40,
     token: Optional[str] = None,
+    workers: int = 8,
 ) -> list[dict]:
     """GGUF dışı biçimlerde HuggingFace araması yapar.
 
-    Kitaplık etiketine göre adaylar seçilir; her adayın repo dosyaları
-    denetlenerek biçime uyan dosya bulunanlar döner.
-    Sonuç: {repo_id, downloads, likes, last_modified, file_count}
-    """
-    library = KIND_LIBRARIES.get(kind)
-    if library is None:
-        raise ValueError(f"Bilinmeyen model biçimi: '{kind}'")
+    kind artık bir "etiket"tir: biçim (safetensors/onnx/ct2/embeddings)
+    ya da kategori (image/video/tts/stt/music/text/vision). Etiket hem
+    arama filtresini hem de repo içinde aranacak dosya ipuçlarını
+    belirler; yalnızca uygun dosyayı içeren repolar döner.
 
+    Repo dosyası denetimi eşzamanlı (thread pool) yapılır; HF hız
+    sınırına (429) takılan istekler sessizce atlanır, kalan adaylarla
+    devam edilir. Sonuç: {repo_id, downloads, likes, last_modified,
+    file_count, pipeline}
+    """
     api = _api(token)
-    candidates = _list_models_by_library(api, library, query or "", scan_max)
-    results: list[dict] = []
-    for m in candidates:
+    candidates = _list_models_by_filter(api, kind, query or "", scan_max)
+
+    def _check(m) -> Optional[dict]:
         repo_id = m.modelId
-        files = get_kind_files(repo_id, kind, token=token)
+        try:
+            files = get_kind_files(repo_id, kind, token=token)
+        except Exception:
+            return None
         if not files:
-            continue
-        results.append({
+            return None
+        return {
             "repo_id": repo_id,
             "downloads": getattr(m, "downloads", 0) or 0,
             "likes": getattr(m, "likes", 0) or 0,
             "last_modified": getattr(m, "lastModified", "") or "",
             "file_count": len(files),
-        })
-        if len(results) >= limit:
-            break
+            "pipeline": getattr(m, "pipeline_tag", "") or "",
+        }
+
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for rec in pool.map(_check, candidates):
+            if rec is None:
+                continue
+            results.append(rec)
+            if len(results) >= limit:
+                break
     return results
 
 
@@ -333,12 +447,13 @@ _kind_cache_lock = threading.Lock()
 def browse_for_kind(
     kind: str = KIND_EMBEDDINGS,
     limit: int = 150,
-    scan_max: int = 300,
+    scan_max: int = 80,
     token: Optional[str] = None,
+    workers: int = 8,
 ) -> list[dict]:
-    """Belirli bir biçimdeki modellerin geniş kataloğu (popup boş arama).
+    """Belirli bir etiket(kategori/biçim)deki modellerin geniş kataloğu.
 
-    Sonuç kısa süreliğine biçim başına önbelleğe alınır; ilk sorgu birkaç
+    Sonuç kısa süreliğine etiket başına önbelleğe alınır; ilk sorgu birkaç
     saniye sürebilir, tekrar açılışlarda anında döner.
     """
     with _kind_cache_lock:
@@ -346,7 +461,9 @@ def browse_for_kind(
         if cached is not None and cached["ts"] + _BROWSE_TTL > time.time():
             return [dict(r) for r in cached["items"]]
 
-    results = search_kind("", kind=kind, limit=limit, scan_max=scan_max, token=token)
+    results = search_kind(
+        "", kind=kind, limit=limit, scan_max=scan_max, token=token, workers=workers
+    )
 
     with _kind_cache_lock:
         _kind_cache[kind] = {"ts": time.time(), "items": [dict(r) for r in results]}
@@ -456,6 +573,11 @@ class _RepoProgressTqdm:
         self.disable = bool(kwargs.get("disable") or False)
 
     def update(self, n: int = 1) -> None:
+        # İptal sinyali dosya aktarımı sürerken de denetlenir; snapshot
+        # tabanlı indirmeler böylece anında durdurulabilir.
+        with _downloads_lock:
+            if self.repo_id in _cancelled:
+                raise DownloadCancelledError()
         self.n += int(n or 0)
         _update_progress(self.repo_id, self.n, self.total or self.n, "indiriliyor")
 
@@ -583,6 +705,142 @@ def _resolve_url(repo_id: str, filename: str, revision: str = "main") -> str:
     return f"https://huggingface.co/{repo_id}/resolve/{revision}/{filename}"
 
 
+def _matches_any(name: str, patterns: list[str]) -> bool:
+    """Bir dosya adı verilen glob desenlerinden biriyle eşleşiyor mu?"""
+    return any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
+
+
+def _repo_file_sizes(
+    repo_id: str, revision: str = "main", token: Optional[str] = None
+) -> dict[str, int]:
+    """Repo'daki dosyaların ad → boyut eşlemesini döner (bilinmeyen 0)."""
+    info = _api(token).model_info(repo_id, revision=revision, files_metadata=True)
+    sizes: dict[str, int] = {}
+    for sibling in info.siblings or []:
+        name = getattr(sibling, "rfilename", "")
+        if not name:
+            continue
+        sizes[name] = int(getattr(sibling, "size", 0) or 0)
+    return sizes
+
+
+def download_files(
+    repo_id: str,
+    dest: Path | str,
+    allow_patterns: Optional[list[str]] = None,
+    ignore_patterns: Optional[list[str]] = None,
+    revision: str = "main",
+    token: Optional[str] = None,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    sizes: Optional[dict[str, int]] = None,
+) -> dict:
+    """Repo içindeki dosyaları tek tek, toplam ilerlemeyle ve iptal edilebilir indirir.
+
+    ``snapshot_download``'tan farkı: her dosya Range destekli ``.part``
+    akışıyla iner, ilerleme repo genelinde toplanır ve ``cancel_check``
+    her parçada denetlenir. İptalde yalnızca yarım ``.part`` dosyaları
+    silinir; tamamlanmış dosyalar yeniden kullanım için bırakılır.
+    Dönen sözlük: indirilen/atlanan dosya sayısı, alınan/toplam bayt.
+    """
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    if sizes is None:
+        sizes = _repo_file_sizes(repo_id, revision=revision, token=token)
+
+    allow = list(allow_patterns or [])
+    ignore = list(ignore_patterns or [])
+    selected: list[tuple[str, int]] = []
+    for name, size in sizes.items():
+        if allow and not _matches_any(name, allow):
+            continue
+        if ignore and _matches_any(name, ignore):
+            continue
+        selected.append((name, int(size or 0)))
+
+    if not selected:
+        raise RuntimeError(f"'{repo_id}' için indirilecek dosya bulunamadı.")
+
+    total = sum(size for _, size in selected)
+
+    def _is_cancelled() -> bool:
+        if cancel_check and cancel_check():
+            return True
+        with _downloads_lock:
+            return repo_id in _cancelled
+
+    def _raise_if_cancelled() -> None:
+        if _is_cancelled():
+            raise DownloadCancelledError()
+
+    root = dest.resolve()
+    base_received = 0
+    received = 0
+    downloaded = 0
+    skipped = 0
+    parts_created: list[Path] = []
+
+    _raise_if_cancelled()
+    try:
+        for name, size in selected:
+            target = (dest / name).resolve()
+            if target != root and root not in target.parents:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+            if target.is_file() and (size <= 0 or target.stat().st_size == size):
+                base_received += size if size > 0 else target.stat().st_size
+                received = base_received
+                skipped += 1
+                stale_part = target.with_suffix(target.suffix + ".part")
+                try:
+                    stale_part.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                if progress_cb:
+                    progress_cb(received, total)
+                continue
+
+            part = target.with_suffix(target.suffix + ".part")
+            parts_created.append(part)
+
+            def _on_bytes(got: int, _file_total: int, _base: int = base_received) -> None:
+                nonlocal received
+                received = _base + got
+                if progress_cb:
+                    progress_cb(received, total)
+
+            result = _resumable_get(
+                _resolve_url(repo_id, name, revision),
+                part,
+                token,
+                _on_bytes if progress_cb else None,
+                _is_cancelled,
+            )
+            part.replace(target)
+            base_received += int(result["received"])
+            received = base_received
+            downloaded += 1
+            if progress_cb:
+                progress_cb(received, total)
+        return {
+            "downloaded": downloaded,
+            "skipped": skipped,
+            "received": received,
+            "total": total,
+            "files": len(selected),
+            "dest": str(dest),
+        }
+    except DownloadCancelledError:
+        for part in parts_created:
+            try:
+                part.unlink(missing_ok=True)
+            except OSError:
+                pass
+        # İptal dışındaki hatalarda .part dosyaları sürdürme için korunur.
+        raise
+
+
 def download_model(
     repo_id: str,
     filename: str,
@@ -688,29 +946,31 @@ def download_by_kind(
     models_dir: Optional[Path | str] = None,
     token: Optional[str] = None,
 ) -> DownloadResult:
-    """Modeli biçimine uygun şekilde indirir (GGUF + tip bazlı).
+    """Modeli biçimine uygun şekilde indirir (GGUF + tip bazlı + kategori).
 
-    GGUF: seçilen/verilen dosya modeller/ köküne iner (mevcut akış).
-    Diğer biçimler: repo snapshot olarak modeller/<biçim>/<org_ne_adı>
-    klasörüne iner (safetensors/onnx/ct2/embeddings). İndirme iptal
-    edilebilir; iptal sinyali önce denetlenir.
+    kind bir "etiket" olabilir: biçim (safetensors/onnx/ct2/embeddings)
+    ya da kategori (image/video/music/tts/stt/text/vision). Etiket hem
+    indirme biçimini hem de models/ altına kurulacak klasörü belirler.
+
+    GGUF: seçilen/verilen dosya models/ köküne iner (mevcut akış).
+    Diğerleri: repo snapshot olarak models/<etiket>/<org_ne_adı> klasörüne
+    iner. İndirme iptal edilebilir; iptal sinyali önce denetlenir.
     """
-    if kind not in (KIND_GGUF, KIND_SAFETENSORS, KIND_ONNX, KIND_CT2, KIND_EMBEDDINGS):
-        raise ValueError(f"Bilinmeyen model biçimi: '{kind}'")
-
-    models_dir = Path(models_dir or settings.models_dir)
-    models_dir.mkdir(parents=True, exist_ok=True)
-
     if kind == KIND_GGUF:
         if not filename:
             filename = pick_gguf(repo_id, token=token).filename
         return download_model(repo_id, filename, revision, models_dir, token)
 
+    format_, subdir, _hints = target_for(kind)
+
+    models_dir = Path(models_dir or settings.models_dir)
+    models_dir.mkdir(parents=True, exist_ok=True)
+
     with _downloads_lock:
         if repo_id in _active:
             raise RuntimeError(f"'{repo_id}' için indirme zaten sürüyor")
 
-    target = models_dir / kind / repo_id.replace("/", "_")
+    target = models_dir / subdir / repo_id.replace("/", "_")
     if not target.parent.exists():
         target.parent.mkdir(parents=True, exist_ok=True)
 
@@ -759,23 +1019,61 @@ def download_by_kind(
 # Model silme
 # ------------------------------------------------------------------
 
+def _prune_empty_parents(paths: list[Path], stop: Path) -> None:
+    """Silinen dosyaların boş kalan ara klasörlerini temizler (stop korunur)."""
+    stop = stop.resolve()
+    for path in paths:
+        parent = path.parent
+        while parent != stop and parent.is_dir() and stop in parent.resolve().parents:
+            try:
+                if any(parent.iterdir()):
+                    break
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+
+
+def _gguf_matches(p: Path, model_id: str) -> bool:
+    """Dosya, model kimliğine ya da onun bölünmüş parçalarına mı ait?
+
+    Tek dosya: ``model.guf`` / ``model.gguf.part``; bölünmüş GGUF:
+    ``model-00001-of-00002.gguf`` (ve .part) eşleşir.
+    """
+    name = p.name
+    if name.endswith(".part"):
+        name = name[:-5]
+    stem = Path(name).stem
+    if stem == model_id:
+        return True
+    return bool(re.fullmatch(re.escape(model_id) + r"-\d+-of-\d+", stem))
+
+
 def delete_model_files(model_id: str, models_dir: Optional[Path | str] = None) -> list[str]:
     """Diskteki model dosyalarını (ve varsa yarım indirmesini) siler.
 
     model_id, model yöneticisindeki dosya gövdesiyle aynıdır (dosya adı
-    minüş .gguf). Sistemde ".gguf" eşleşmesine göre temizler.
+    eksi .gguf). Tek dosya, bölünmüş GGUF parçaları ve .part kalıntıları
+    temizlenir; ardından boş kalan ara klasörler kaldırılır.
     """
     models_dir = Path(models_dir or settings.models_dir)
     if not models_dir.exists():
         return []
     removed: list[str] = []
-    for p in list(models_dir.rglob("*.gguf")) + list(models_dir.rglob("*.part")):
-        if p.stem == model_id or p.name == f"{model_id}.gguf.part":
-            try:
-                p.unlink()
-                removed.append(p.name)
-            except FileNotFoundError:
-                pass
+    deleted_paths: list[Path] = []
+    candidates = list(models_dir.rglob("*.gguf")) + list(models_dir.rglob("*.gguf.part"))
+    for p in candidates:
+        if not _gguf_matches(p, model_id):
+            continue
+        try:
+            p.unlink()
+            removed.append(p.name)
+            deleted_paths.append(p)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.exception("Model dosyası silinemedi: %s", p)
+    _prune_empty_parents(deleted_paths, models_dir)
     # Tip bazlı model dizinleri (safetensors/onnx/ct2/embeddings)
     from app.registry import delete_typed_model
 

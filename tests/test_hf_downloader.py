@@ -596,6 +596,85 @@ def test_search_kind_falls_back_to_legacy_library_arg(monkeypatch):
 
 
 # ------------------------------------------------------------------
+# Kategori etiketleri (image/video/music/tts/stt/text/vision)
+# ------------------------------------------------------------------
+
+def test_target_for_category_labels():
+    """Kategori etiketleri doğru (biçim, klasör) çiftine çözülür."""
+    assert hf.target_for("image")[:2] == (hf.KIND_SAFETENSORS, "image")
+    assert hf.target_for("video")[:2] == (hf.KIND_SAFETENSORS, "video")
+    assert hf.target_for("music")[:2] == (hf.KIND_SAFETENSORS, "music")
+    assert hf.target_for("tts")[:2] == (hf.KIND_SAFETENSORS, "tts")
+    assert hf.target_for("stt")[:2] == (hf.KIND_CT2, "stt")
+    assert hf.target_for("text")[:2] == (hf.KIND_SAFETENSORS, "text")
+    assert hf.target_for("vision")[:2] == (hf.KIND_SAFETENSORS, "vision")
+    assert hf.target_for("embeddings")[:2] == (hf.KIND_EMBEDDINGS, "embeddings")
+
+
+def test_search_kind_uses_pipeline_filter(monkeypatch):
+    """Kategori etiketleri pipeline_tag filtresiyle aranır (music -> text-to-audio)."""
+    FakeApi.all_models = [FakeListModel("facebook/musicgen-small", downloads=99)]
+    FakeApi.repo_file_map = {"facebook/musicgen-small": ["model.safetensors", "config.json"]}
+    monkeypatch.setattr(hf, "_api", lambda token=None: FakeApi())
+
+    results = hf.search_kind("", kind="music", limit=5)
+
+    assert FakeApi.recorded_kwargs["pipeline_tag"] == "text-to-audio"
+    assert [r["repo_id"] for r in results] == ["facebook/musicgen-small"]
+
+
+def test_download_by_kind_category_to_subdir(monkeypatch, tmp_path):
+    """Kategori etiketiyle indirme models/<kategori>/<org_ad> altına iner."""
+    def fake_snapshot(**kwargs):
+        import pathlib
+
+        p = pathlib.Path(kwargs["local_dir"])
+        p.mkdir(parents=True, exist_ok=True)
+        (p / "model.safetensors").write_bytes(b"abc")
+        return str(p)
+
+    monkeypatch.setattr(hf, "snapshot_download", fake_snapshot)
+
+    result = hf.download_by_kind("facebook/musicgen-small", kind="music", models_dir=tmp_path)
+
+    assert result.path == tmp_path / "music" / "facebook_musicgen-small"
+    assert (result.path / "model.safetensors").exists()
+
+
+def test_hf_retry_retries_on_rate_limit(monkeypatch):
+    """429 hız sınırında çağrı yeniden denenir; sonunda başarılı olur."""
+    class RateLimited(Exception):
+        def __init__(self):
+            super().__init__("429 Too Many Requests")
+            self.response = type("R", (), {"status_code": 429})()
+
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RateLimited()
+        return "ok"
+
+    monkeypatch.setattr(hf.time, "sleep", lambda *_: None)
+    assert hf._hf_retry(flaky) == "ok"
+    assert calls["n"] == 3
+
+
+def test_hf_retry_reraises_other_errors():
+    """429 dışındaki hatalar yeniden denenmeden yükseltilir."""
+    calls = {"n": 0}
+
+    def boom():
+        calls["n"] += 1
+        raise RuntimeError("başka hata")
+
+    with pytest.raises(RuntimeError):
+        hf._hf_retry(boom)
+    assert calls["n"] == 1
+
+
+# ------------------------------------------------------------------
 # safetensors indirme desenleri (disk tasarrufu)
 # ------------------------------------------------------------------
 
@@ -644,3 +723,84 @@ def test_ignore_patterns_exclude_onnx_and_media():
     assert "*.onnx" in hf._SNAPSHOT_IGNORE_PATTERNS
     assert "*openvino*" in hf._SNAPSHOT_IGNORE_PATTERNS
     assert "*.png" in hf._SNAPSHOT_IGNORE_PATTERNS
+
+
+# ------------------------------------------------------------------
+# İptal + toplam ilerleme + bölünmüş GGUF silme
+# ------------------------------------------------------------------
+
+def test_repo_progress_tqdm_raises_on_cancel():
+    """snapshot ilerleme sınıfı iptal işaretinde aktarımı keser."""
+    bar = hf._RepoProgressTqdm(repo_id="org/iptal")
+    hf._cancelled.add("org/iptal")
+    try:
+        with pytest.raises(hf.DownloadCancelledError):
+            bar.update(1024)
+    finally:
+        hf._cancelled.discard("org/iptal")
+
+
+def test_download_files_aggregate_progress_and_skip(tmp_path, monkeypatch):
+    """download_files toplam bayt ilerlemesi verir, var olan dosyaları atlar."""
+    progress = []
+
+    def fake_get(url, dest, token, progress_cb=None, cancel_check=None):
+        data = b"x" * (4 if url.endswith("a.bin") else 6)
+        dest.write_bytes(data)
+        if progress_cb:
+            progress_cb(len(data), len(data))
+        return {"received": len(data), "total": len(data)}
+
+    monkeypatch.setattr(hf, "_resumable_get", fake_get)
+
+    result = hf.download_files(
+        "org/veri", tmp_path / "hedef",
+        sizes={"a.bin": 4, "b.bin": 6}, progress_cb=lambda r, t: progress.append((r, t)),
+    )
+
+    assert result["downloaded"] == 2
+    assert result["received"] == 10 and result["total"] == 10
+    assert progress[-1] == (10, 10)
+    assert (tmp_path / "hedef" / "a.bin").read_bytes() == b"xxxx"
+    assert (tmp_path / "hedef" / "b.bin").read_bytes() == b"xxxxxx"
+
+    # İkinci çağrıda boyutu eşleşen dosyalar yeniden indirilmez.
+    again = hf.download_files(
+        "org/veri", tmp_path / "hedef", sizes={"a.bin": 4, "b.bin": 6},
+    )
+    assert again["downloaded"] == 0
+    assert again["skipped"] == 2
+
+
+def test_download_files_cancel_cleans_part_files(tmp_path, monkeypatch):
+    """İptalde yarım .part silinir; tamamlanmış hedef bırakılmaz."""
+    def fake_get(url, dest, token, progress_cb=None, cancel_check=None):
+        dest.write_bytes(b"yarim")
+        raise hf.DownloadCancelledError()
+
+    monkeypatch.setattr(hf, "_resumable_get", fake_get)
+
+    with pytest.raises(hf.DownloadCancelledError):
+        hf.download_files("org/iptal", tmp_path / "hedef", sizes={"a.bin": 100})
+
+    assert not (tmp_path / "hedef" / "a.bin").exists()
+    assert not (tmp_path / "hedef" / "a.bin.part").exists()
+
+
+def test_delete_model_files_removes_split_shards_and_prunes_dirs(tmp_path):
+    """Bölünmüş GGUF parçaları ve .part kalıntıları silinir; boş klasör temizlenir."""
+    org = tmp_path / "org"
+    org.mkdir()
+    (org / "model-00001-of-00002.gguf").write_bytes(b"1")
+    (org / "model-00002-of-00002.gguf").write_bytes(b"2")
+    (org / "model-00001-of-00002.gguf.part").write_bytes(b"3")
+    (org / "baska.gguf").write_bytes(b"4")
+
+    removed = hf.delete_model_files("model", models_dir=tmp_path)
+
+    assert not (org / "model-00001-of-00002.gguf").exists()
+    assert not (org / "model-00002-of-00002.gguf").exists()
+    assert not (org / "model-00001-of-00002.gguf.part").exists()
+    assert (org / "baska.gguf").exists()  # ilgisiz dosya korunur
+    assert org.exists()                   # hâlâ dosya var, klasör silinmez
+    assert any(name.endswith("model-00002-of-00002.gguf") for name in removed)

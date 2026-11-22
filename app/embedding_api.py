@@ -11,6 +11,7 @@
 #  Kullanım: POST /v1/embeddings  {"model":"all-MiniLM-L6-v2","input":"merhaba"}
 # ─────────────────────────────────────────────────────────────
 
+import asyncio
 import math
 from typing import Optional, Union
 
@@ -21,6 +22,7 @@ from pydantic import BaseModel
 from app import embedding_backend, registry
 from app.config import settings
 from app.gateway import ApiContext, api_auth
+from app.runtime_coord import accelerator
 router = APIRouter(
     prefix="/v1",
     tags=["embeddings"],
@@ -121,7 +123,8 @@ async def create_embeddings(
         return _openai_error(400, "input boş olamaz.", code="invalid_input")
 
     try:
-        vectors = backend.embed(texts)
+        async with accelerator.acquire(f"embedding:{req.model}"):
+            vectors = await asyncio.to_thread(backend.embed, texts)
     except Exception as exc:
         return _openai_error(
             503,

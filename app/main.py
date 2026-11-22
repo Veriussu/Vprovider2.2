@@ -28,10 +28,12 @@ from app.comfy_api import video_router as comfy_video_router
 from app.config import settings
 from app.embedding_api import router as embedding_router
 from app.gpu_detect import compiled_backends, detect_hardware, resolve_runtime
+from app import plugins
 from app.openai_api import router as openai_router
 from app.stt_api import router as stt_router
 from app.tts_api import router as tts_router
 from app.music_api import router as music_router
+from app.plugin_api import router as plugin_router
 from app.user_store import get_store
 
 # Yönetim panelinin tek dosyalık ön yüzü
@@ -58,7 +60,10 @@ async def lifespan(app: FastAPI):
         hw.name or hw.vendor,
         ", ".join(compiled_backends()),
     )
+    # Kurulu eklenti servislerini arka planda hazır tut (istek beklemeden).
+    plugins.start_supervisor()
     yield
+    plugins.stop_supervisor()
     logger.info("%s sunucusu kapatıldı", settings.app_name)
 
 
@@ -90,6 +95,9 @@ app.include_router(stt_router)
 
 # OpenAI uyumlu müzik üretimi (API anahtarı korumalı)
 app.include_router(music_router)
+
+# Eklenti köprü uçları: /v1/images/upscale, /v1/videos/restore, /v1/videos/lipsync
+app.include_router(plugin_router)
 
 # Yönetim paneli API'si (kurulum, giriş, model/site yönetimi)
 app.include_router(admin_router)

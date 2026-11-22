@@ -10,17 +10,32 @@
 # ─────────────────────────────────────────────────────────────
 
 import json
+import struct
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app import auth
+from app import external_llama as external_llama_mod
 from app import main as main_mod
 from app import openai_api as openai_api_mod
 from app.model_manager import ModelManager
 from app.user_store import UserStore
 
 TEST_API_KEY = "test-anahtar-123"
+
+
+def _gguf_s(text: str) -> bytes:
+    data = text.encode("utf-8")
+    return struct.pack("<Q", len(data)) + data
+
+
+def _write_minimal_gguf(path, tensor_type: int = 2):
+    data = [b"GGUF", struct.pack("<IQQ", 3, 1, 1)]
+    data += [_gguf_s("general.architecture"), struct.pack("<I", 8), _gguf_s("qwen")]
+    data += [_gguf_s("output.weight"), struct.pack("<I", 2)]
+    data += [struct.pack("<QQ", 8, 8), struct.pack("<I", tensor_type), struct.pack("<Q", 0)]
+    path.write_bytes(b"".join(data))
 
 
 class FakeEngine:
@@ -121,7 +136,7 @@ def _kur_client(tmp_path, monkeypatch, mode="content"):
 
     models_dir = tmp_path / "models"
     models_dir.mkdir()
-    (models_dir / "test-model.gguf").write_bytes(b"data")
+    _write_minimal_gguf(models_dir / "test-model.gguf")
 
     manager = ModelManager(
         models_dir=models_dir,
@@ -160,8 +175,8 @@ def client(tmp_path, monkeypatch):
     # Sahte model içeren yönetici
     models_dir = tmp_path / "models"
     models_dir.mkdir()
-    (models_dir / "test-model.gguf").write_bytes(b"data")
-    (models_dir / "diger-model.gguf").write_bytes(b"data")
+    _write_minimal_gguf(models_dir / "test-model.gguf")
+    _write_minimal_gguf(models_dir / "diger-model.gguf")
 
     manager = ModelManager(
         models_dir=models_dir,
@@ -169,6 +184,9 @@ def client(tmp_path, monkeypatch):
         memory_mode="keep",
     )
     monkeypatch.setattr(openai_api_mod, "get_manager", lambda: manager)
+    # Eklentiyle gelen modeller gerçek kuruluma bağlıdır; testi yalıtmak için
+    # liste boşaltılır (eklenti model kapsaması ayrı testte doğrulanır).
+    monkeypatch.setattr(openai_api_mod.plugins, "plugin_models", lambda: [])
 
     return TestClient(main_mod.app)
 
@@ -208,6 +226,75 @@ def test_list_models(client):
     ids = {m["id"] for m in body["data"]}
     assert ids == {"test-model", "diger-model"}
     assert all(m["object"] == "model" for m in body["data"])
+
+
+def test_list_models_includes_plugins(tmp_path, monkeypatch):
+    """Kurulu eklenti modelleri /v1/models listesine eklenir."""
+    store = UserStore(tmp_path / "test.db")
+    store.init()
+    store.create_api_key("Test", TEST_API_KEY)
+    monkeypatch.setattr(auth, "get_store", lambda: store)
+    monkeypatch.setattr(main_mod, "get_store", lambda: store)
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    _write_minimal_gguf(models_dir / "test-model.gguf")
+    manager = ModelManager(
+        models_dir=models_dir,
+        engine_factory=lambda info: FakeEngine(str(info.path)),
+        memory_mode="keep",
+    )
+    monkeypatch.setattr(openai_api_mod, "get_manager", lambda: manager)
+    monkeypatch.setattr(
+        openai_api_mod.plugins,
+        "plugin_models",
+        lambda: [
+            {"id": "musicgen_small", "category": "music", "api": "POST /v1/audio/music/generate"},
+            {"id": "real_esrgan", "category": "upscale", "api": "POST /v1/images/upscale"},
+        ],
+    )
+
+    resp = TestClient(main_mod.app).get(
+        "/v1/models", headers={"Authorization": f"Bearer {TEST_API_KEY}"}
+    )
+    assert resp.status_code == 200
+    by_id = {m["id"]: m for m in resp.json()["data"]}
+    assert "musicgen_small" in by_id
+    assert by_id["musicgen_small"]["pricing"]["task"] == "music"
+    assert by_id["real_esrgan"]["pricing"]["task"] == "upscale"
+
+
+def test_unsupported_prism_runtime_gets_clear_error(tmp_path, monkeypatch):
+    """PQ2_0/PTQ1_0 gibi özel GGUF'ler stock motora verilmez; net hata döner."""
+    store = UserStore(tmp_path / "test.db")
+    store.init()
+    store.create_api_key("Test", TEST_API_KEY)
+    monkeypatch.setattr(auth, "get_store", lambda: store)
+    monkeypatch.setattr(main_mod, "get_store", lambda: store)
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    _write_minimal_gguf(models_dir / "bonsai.gguf", tensor_type=142)
+    manager = ModelManager(
+        models_dir=models_dir,
+        engine_factory=lambda info: FakeEngine(str(info.path)),
+        memory_mode="keep",
+    )
+    monkeypatch.setattr(openai_api_mod, "get_manager", lambda: manager)
+    monkeypatch.setattr(external_llama_mod.settings, "prism_llama_server_bin", "")
+    monkeypatch.setattr(external_llama_mod, "prism_server_bin", lambda: None)
+    monkeypatch.setattr(openai_api_mod, "prism_server_bin", lambda: None)
+
+    c = TestClient(main_mod.app)
+    resp = c.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        json={"model": "bonsai", "messages": [{"role": "user", "content": "x"}]},
+    )
+
+    assert resp.status_code == 501
+    assert resp.json()["error"]["code"] == "unsupported_model_runtime"
+    assert "Prism/Bonsai" in resp.json()["error"]["message"]
 
 
 # ------------------------------------------------------------------

@@ -21,8 +21,15 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app import registry
+from app import plugins, registry
+from app.external_llama import (
+    ExternalRuntimeUnavailable,
+    needs_external_runtime,
+    prism_server_bin,
+    runtime_for,
+)
 from app.gateway import ApiContext, api_auth
+from app.gguf_inspect import GgufReadError, inspect_gguf, runtime_note_for
 from app.model_manager import get_manager
 
 # OpenAI uyumlu router; tüm /v1/* istekleri API anahtarı ister
@@ -139,7 +146,7 @@ def _openai_error(status: int, message: str, param: str | None = None, code: str
     )
 
 
-def _require_model(model_id: str) -> None:
+def _require_model(model_id: str):
     """Model diskte yoksa OpenAI uyumlu 404 hatası verir."""
     model = get_manager().get_model(model_id)
     if model is None:
@@ -149,6 +156,23 @@ def _require_model(model_id: str) -> None:
             param="model",
             code="model_not_found",
         )
+    return model
+
+
+def _runtime_error(exc: Exception, model_id: str):
+    return _openai_error(
+        501,
+        str(exc),
+        param="model",
+        code="unsupported_model_runtime",
+    )
+
+
+def _external_payload(req: BaseModel, stream: bool | None = None) -> dict:
+    payload = req.model_dump(exclude_none=True)
+    if stream is not None:
+        payload["stream"] = stream
+    return payload
 
 
 def _task_for(model_id: str) -> str:
@@ -328,6 +352,15 @@ def list_models():
     manager = get_manager()
     data = []
     for model in manager.list_models():
+        runtime = {"engine": "llama-cpp-python", "supported": True, "note": "Stock llama.cpp uyumlu."}
+        try:
+            gguf = inspect_gguf(model.path)
+            runtime["note"] = runtime_note_for(gguf)
+            if gguf.requires_external_runtime:
+                runtime["engine"] = "external-llama-server"
+                runtime["supported"] = prism_server_bin() is not None
+        except (GgufReadError, OSError, ValueError) as exc:
+            runtime = {"engine": "unknown", "supported": False, "note": str(exc)}
         data.append(
             {
                 "id": model.model_id,
@@ -339,6 +372,7 @@ def list_models():
                         model.model_id, model.path, manager.models_dir
                     )
                 },
+                "runtime": runtime,
             }
         )
 
@@ -354,6 +388,20 @@ def list_models():
                 "pricing": {"task": entry.category},
             }
         )
+
+    # Eklentiyle gelen modeller (TTS/dudak senkronu/büyütme/onarım/müzik):
+    # kurulu olanlar kendi /v1/* uçları üzerinden çağrılır.
+    for pm in plugins.plugin_models():
+        data.append(
+            {
+                "id": pm["id"],
+                "object": "model",
+                "created": 0,
+                "owned_by": "vprovider",
+                "pricing": {"task": pm.get("category", "generic")},
+                "api": pm.get("api", ""),
+            }
+        )
     return {"object": "list", "data": data}
 
 
@@ -364,9 +412,35 @@ def list_models():
 @router.post("/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, ctx: ApiContext = Depends(api_auth)):
     """Sohbet yanıtı üretir; stream=True ise SSE akışı döner."""
-    _require_model(req.model)
+    model = _require_model(req.model)
     params = _filter_params(req)
     messages = [m.model_dump() for m in req.messages]
+    if needs_external_runtime(model):
+        try:
+            runtime = runtime_for(model)
+        except ExternalRuntimeUnavailable as exc:
+            raise _runtime_error(exc, req.model) from exc
+        if req.stream:
+            payload = _external_payload(req, stream=True)
+            return StreamingResponse(
+                _external_stream_generator(
+                    runtime, "/chat/completions", payload, _task_for(req.model), req.model, ctx
+                ),
+                media_type="text/event-stream",
+                headers=STREAM_HEADERS,
+        )
+        payload = _external_payload(req, stream=False)
+        try:
+            body = await runtime.post_json("/chat/completions", payload)
+        except ExternalRuntimeUnavailable as exc:
+            raise _runtime_error(exc, req.model) from exc
+        usage = body.get("usage") or {}
+        ctx.charge(
+            _task_for(req.model), model_id=req.model,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+        )
+        return body
 
     if req.stream:
         return StreamingResponse(
@@ -390,6 +464,30 @@ async def chat_completions(req: ChatCompletionRequest, ctx: ApiContext = Depends
         completion_tokens=usage.get("completion_tokens", 0),
     )
     return _chat_response(req.model, content, usage, tool_calls=tool_calls, finish_reason=finish)
+
+
+async def _external_stream_generator(
+    runtime, endpoint: str, payload: dict, task: str, model_id: str, ctx: ApiContext = None
+) -> AsyncIterator[str]:
+    """Proxy OpenAI-compatible SSE from an external runtime and charge usage."""
+    usage: dict = {}
+    async for line in runtime.stream(endpoint, payload):
+        if line.startswith("data: "):
+            data = line[6:].strip()
+            if data and data != "[DONE]":
+                try:
+                    item = json.loads(data)
+                    if isinstance(item, dict) and item.get("usage"):
+                        usage = item["usage"]
+                except json.JSONDecodeError:
+                    pass
+        yield line
+    if ctx is not None and usage:
+        ctx.charge(
+            task, model_id=model_id,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+        )
 
 
 async def _chat_stream_generator(
@@ -468,8 +566,34 @@ async def _chat_stream_generator(
 @router.post("/completions")
 async def completions(req: CompletionRequest, ctx: ApiContext = Depends(api_auth)):
     """Metin tamamlama yanıtı üretir; stream=True ise SSE akışı döner."""
-    _require_model(req.model)
+    model = _require_model(req.model)
     params = _filter_params(req)
+    if needs_external_runtime(model):
+        try:
+            runtime = runtime_for(model)
+        except ExternalRuntimeUnavailable as exc:
+            raise _runtime_error(exc, req.model) from exc
+        if req.stream:
+            payload = _external_payload(req, stream=True)
+            return StreamingResponse(
+                _external_stream_generator(
+                    runtime, "/completions", payload, _task_for(req.model), req.model, ctx
+                ),
+                media_type="text/event-stream",
+                headers=STREAM_HEADERS,
+        )
+        payload = _external_payload(req, stream=False)
+        try:
+            body = await runtime.post_json("/completions", payload)
+        except ExternalRuntimeUnavailable as exc:
+            raise _runtime_error(exc, req.model) from exc
+        usage = body.get("usage") or {}
+        ctx.charge(
+            _task_for(req.model), model_id=req.model,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+        )
+        return body
 
     if req.stream:
         return StreamingResponse(
@@ -765,9 +889,48 @@ async def responses(req: ResponsesRequest, ctx: ApiContext = Depends(api_auth)):
     Codex CLI gibi araçların konuştuğu şema: input + instructions ile sor,
     output içinde message/function_call kalemleriyle cevap al.
     """
-    _require_model(req.model)
+    model = _require_model(req.model)
     messages = _responses_input_to_messages(req.input, req.instructions)
     params = _responses_params(req)
+
+    if needs_external_runtime(model):
+        try:
+            runtime = runtime_for(model)
+        except ExternalRuntimeUnavailable as exc:
+            raise _runtime_error(exc, req.model) from exc
+
+        chat_payload = {
+            "model": req.model,
+            "messages": messages,
+            **params,
+        }
+        if req.stream:
+            chat_payload["stream"] = True
+            if req.stream_options is not None:
+                chat_payload["stream_options"] = req.stream_options
+            return StreamingResponse(
+                _external_responses_stream_generator(runtime, chat_payload, req, ctx),
+                media_type="text/event-stream",
+                headers=STREAM_HEADERS,
+            )
+
+        chat_payload["stream"] = False
+        try:
+            body = await runtime.post_json("/chat/completions", chat_payload)
+        except ExternalRuntimeUnavailable as exc:
+            raise _runtime_error(exc, req.model) from exc
+        choice = (body.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        content = msg.get("content") or ""
+        tool_calls = msg.get("tool_calls")
+        usage = body.get("usage") or {}
+        ctx.charge(
+            _task_for(req.model), model_id=req.model,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+        )
+        output = _responses_output_items(content, tool_calls)
+        return _resp_obj(req.model, req, output, usage, status="completed")
 
     if req.stream:
         return StreamingResponse(
@@ -786,6 +949,85 @@ async def responses(req: ResponsesRequest, ctx: ApiContext = Depends(api_auth)):
     )
     output = _responses_output_items(content, tool_calls)
     return _resp_obj(req.model, req, output, usage, status="completed")
+
+
+async def _external_responses_stream_generator(
+    runtime, chat_payload: dict, req: ResponsesRequest, ctx: ApiContext = None
+) -> AsyncIterator[str]:
+    """Translate external chat.completions SSE into Responses SSE."""
+    model_id = req.model
+    resp_id = f"resp_{uuid4().hex[:12]}"
+    created_at = time.time()
+    pending = _resp_obj(
+        model_id, req, [], _responses_usage({}), status="in_progress",
+        created_at=created_at, resp_id=resp_id,
+    )
+    yield _sse_resp_event({"type": "response.created", "response": pending})
+    yield _sse_resp_event({"type": "response.in_progress", "response": pending})
+
+    msg_item_id = f"msg_{uuid4().hex[:12]}"
+    content_buf = ""
+    usage: dict = {}
+    async for line in runtime.stream("/chat/completions", chat_payload):
+        if not line.startswith("data: "):
+            continue
+        data = line[6:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if payload.get("usage"):
+            usage = payload["usage"]
+        choice = (payload.get("choices") or [{}])[0]
+        delta = choice.get("delta") or {}
+        text = delta.get("content") or ""
+        if not text:
+            continue
+        if not content_buf:
+            yield _sse_resp_event(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": _msg_item(msg_item_id, status="in_progress", text=""),
+                }
+            )
+            yield _sse_resp_event(
+                {
+                    "type": "response.content_part.added",
+                    "item_id": msg_item_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                }
+            )
+        content_buf += text
+        yield _sse_resp_event(
+            {
+                "type": "response.output_text.delta",
+                "item_id": msg_item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": text,
+                "logprobs": [],
+            }
+        )
+
+    output = [_msg_item(msg_item_id, status="completed", text=content_buf)] if content_buf else []
+    if output:
+        yield _sse_resp_event({"type": "response.output_item.done", "output_index": 0, "item": output[0]})
+    if ctx is not None and usage:
+        ctx.charge(
+            _task_for(model_id), model_id=model_id,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+        )
+    completed = _resp_obj(model_id, req, output, usage, status="completed",
+                          created_at=created_at, resp_id=resp_id)
+    yield _sse_resp_event({"type": "response.completed", "response": completed})
+    yield _sse_resp_event({"type": "response.done", "response": completed})
+    yield "data: [DONE]\n\n"
 
 
 async def _responses_stream_generator(

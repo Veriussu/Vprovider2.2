@@ -19,6 +19,7 @@ import time
 from typing import Optional
 
 from app.config import settings
+from app.tts_text import normalize_tts_text
 
 logger = logging.getLogger("vprovider")
 
@@ -97,11 +98,66 @@ async def _synthesize_edge(text: str, voice: str, rate: str) -> tuple[bytes, str
     return buf.getvalue(), "audio/mpeg"
 
 
+async def _post_json(url: str, payload: dict):
+    """Eklenti servisine JSON POST atar (test için ayrı tutulur)."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=TTS_TIMEOUT) as client:
+        return await client.post(url, json=payload)
+
+
+async def _synthesize_plugin(
+    text: str,
+    language: str = "en",
+    reference_path: str = "",
+    reference_b64: str = "",
+) -> tuple[bytes, str]:
+    """Çalışan TTS eklentisiyle (XTTS-v2) konuşma üretir -> (wav, "audio/wav")."""
+    import base64
+
+    from app import plugins
+    from app.runtime_coord import accelerator
+
+    found = plugins.running_port_for_category("tts", prefer=("xtts_v2",))
+    if found is None:
+        raise TTSError(
+            "TTS eklentisi çalışmıyor; XTTS-v2'yi Panel > Eklentiler'den başlatın."
+        )
+    _plugin_id, port = found
+
+    payload: dict = {"text": text, "language": language or "en"}
+    if reference_path:
+        payload["reference_path"] = reference_path
+    if reference_b64:
+        payload["reference_b64"] = reference_b64
+
+    url = f"http://127.0.0.1:{port}/synthesize"
+    async with accelerator.acquire("plugin:tts"):
+        try:
+            resp = await _post_json(url, payload)
+        except Exception as exc:  # noqa: BLE001
+            raise TTSError(f"TTS eklentisine ulaşılamadı: {exc}") from exc
+
+    if resp.status_code != 200:
+        try:
+            detail = resp.json().get("error", resp.text)
+        except ValueError:
+            detail = resp.text
+        raise TTSError(f"TTS eklenti hatası: {detail}")
+
+    data = resp.json()
+    audio_b64 = data.get("audio")
+    if not audio_b64:
+        raise TTSError("TTS eklentisi ses döndürmedi.")
+    return base64.b64decode(audio_b64), "audio/wav"
+
+
 async def synthesize(
     text: str,
     voice: str = "",
     engine: str = "",
     rate: str = "",
+    language: str = "",
 ) -> tuple[bytes, str]:
     """Metni seslendirir.
 
@@ -110,7 +166,7 @@ async def synthesize(
     if not settings.tts_enabled:
         raise TTSError("Ses üretim modülü kapalı (TTS_ENABLED=false).")
 
-    text = text.strip()
+    text = normalize_tts_text(text)
     if not text:
         raise TTSError("Konuşulacak metin boş olamaz.")
     if len(text) > MAX_TEXT_CHARS:
@@ -122,7 +178,39 @@ async def synthesize(
         rate = rate or settings.tts_voice_rate
         return await _synthesize_edge(text, voice, rate)
 
-    raise TTSError(f"Bilinmeyen ses motoru: {engine} (kullanılabilir: edge).")
+    if engine in ("plugin", "xtts"):
+        return await _synthesize_plugin(
+            text,
+            language=language or _language_from_voice(voice),
+        )
+
+    raise TTSError(f"Bilinmeyen ses motoru: {engine} (kullanılabilir: edge, plugin).")
+
+
+def _language_from_voice(voice: str) -> str:
+    """OpenAI 'voice' alanından XTTS dil kodu çıkarır (ör. 'tr-TR-...' -> 'tr')."""
+    if not voice:
+        return "en"
+    code = voice.split("-")[0].strip().lower()
+    if len(code) == 2 and code.isalpha():
+        return code
+    return "en"
+
+
+def wav_duration_sec(wav: bytes) -> float:
+    """16-bit PCM WAV baytlarından süreyi okur (byte -> saniye)."""
+    import struct
+
+    if len(wav) < 44 or wav[:4] != b"RIFF" or wav[8:12] != b"WAVE":
+        return 0.0
+    try:
+        sample_rate = struct.unpack("<I", wav[24:28])[0]
+        byte_rate = struct.unpack("<I", wav[28:32])[0]
+    except struct.error:
+        return 0.0
+    if not sample_rate or not byte_rate:
+        return 0.0
+    return round(max(0, len(wav) - 44) / byte_rate, 2)
 
 
 def engine_available() -> bool:

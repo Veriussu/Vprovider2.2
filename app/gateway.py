@@ -186,7 +186,9 @@ def authenticate(candidate: str) -> ApiContext:
     monthly = int(record.get("monthly_token_quota") or 0)
     if monthly > 0:
         now = datetime.now(timezone.utc)
-        since = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+        # usage_log.date gün biçiminde tutulur ("YYYY-MM-DD"); ay başı da aynı
+        # biçimde olmalı, aksi halde ayın ilk günü kotası hiç sayılmaz.
+        since = now.replace(day=1).strftime("%Y-%m-%d")
         used = _month_usage_tokens(store, key_id, since)
         if used >= monthly:
             raise _gateway_error(
